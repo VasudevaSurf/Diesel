@@ -4,7 +4,7 @@ import * as Network from "expo-network";
 // Configuration
 const CONFIG = {
   APPS_SCRIPT_URL:
-    "https://script.google.com/macros/s/AKfycbxTxoF5X74IzzAG_tX_00A7EKURPPzrbYBuLOX45eg_WNNXXOKZJ7vl9gQ8mgN8kmAo/exec",
+    "https://script.google.com/macros/s/AKfycbzFd_MZl7qDolMdw5GVtC7cenn4DKAWQnX0NTuq0MP727-DRvq5RFT-nUxt9A7mFyj3/exec",
   ADMIN_PASSWORD: "admin123",
   INVENTORY_PASSWORD: "inventory456",
   TIMEOUT: 15000, // Reduced to 15 seconds for better UX
@@ -28,6 +28,8 @@ const STORAGE_KEYS = {
   PENDING_INVENTORY: "@diesel_tracker:pending_inventory",
   PENDING_MACHINES: "@diesel_tracker:pending_machines",
 };
+
+const DEBUG_MODE = __DEV__;
 
 // Types
 export interface Machine {
@@ -343,49 +345,72 @@ class DieselServiceClass {
     try {
       console.log("🔗 Checking backend connection...");
 
+      // Use a simple GET request first to test connectivity
+      const testUrl = `${
+        CONFIG.APPS_SCRIPT_URL
+      }?action=testBackend&timestamp=${Date.now()}`;
+
+      if (DEBUG_MODE) {
+        console.log(`🔍 Testing connection with URL: ${testUrl}`);
+      }
+
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), CONFIG.TIMEOUT);
 
-      const response = await fetch(
-        `${CONFIG.APPS_SCRIPT_URL}?action=ping&timestamp=${Date.now()}`,
-        {
-          method: "GET",
-          headers: {
-            Accept: "application/json",
-            "Cache-Control": "no-cache",
-          },
-          signal: controller.signal,
-        }
-      );
+      const response = await fetch(testUrl, {
+        method: "GET",
+        headers: {
+          Accept: "application/json",
+          "Cache-Control": "no-cache",
+        },
+        signal: controller.signal,
+      });
 
       clearTimeout(timeoutId);
       const latency = Date.now() - startTime;
 
+      if (DEBUG_MODE) {
+        console.log(`📊 Response details:`, {
+          status: response.status,
+          statusText: response.statusText,
+          contentType: response.headers.get("content-type"),
+          latency: `${latency}ms`,
+        });
+      }
+
       if (response.ok) {
-        console.log(`✅ Backend connected (${latency}ms)`);
+        // Check if we got JSON response
+        const contentType = response.headers.get("content-type");
+        if (contentType && contentType.includes("application/json")) {
+          console.log(`✅ Backend connected (${latency}ms)`);
 
-        const wasConnected = this.connectionStatus.isConnected;
+          const wasConnected = this.connectionStatus.isConnected;
 
-        this.connectionStatus = {
-          ...this.connectionStatus,
-          isConnected: true,
-          lastChecked: new Date().toISOString(),
-          latency,
-          error: undefined,
-        };
+          this.connectionStatus = {
+            ...this.connectionStatus,
+            isConnected: true,
+            lastChecked: new Date().toISOString(),
+            latency,
+            error: undefined,
+          };
 
-        await this.cacheData(
-          STORAGE_KEYS.CONNECTION_STATUS,
-          this.connectionStatus
-        );
+          await this.cacheData(
+            STORAGE_KEYS.CONNECTION_STATUS,
+            this.connectionStatus
+          );
 
-        // If we just connected and have items in queue, process them
-        if (!wasConnected && this.offlineQueue.length > 0) {
-          console.log("🚀 Backend connection restored, processing queue...");
-          setTimeout(() => this.processOfflineQueue(), 500);
+          // If we just connected and have items in queue, process them
+          if (!wasConnected && this.offlineQueue.length > 0) {
+            console.log("🚀 Backend connection restored, processing queue...");
+            setTimeout(() => this.processOfflineQueue(), 500);
+          }
+
+          return true;
+        } else {
+          throw new Error(
+            `Backend returned HTML instead of JSON. Content-Type: ${contentType}. This means the script URL is incorrect or not deployed properly.`
+          );
         }
-
-        return true;
       }
 
       throw new Error(`HTTP ${response.status}: ${response.statusText}`);
@@ -408,6 +433,71 @@ class DieselServiceClass {
       );
       return false;
     }
+  }
+
+  async validateScriptDeployment(): Promise<{
+    isValid: boolean;
+    issues: string[];
+    suggestions: string[];
+  }> {
+    const issues: string[] = [];
+    const suggestions: string[] = [];
+
+    // Check URL format
+    if (!CONFIG.APPS_SCRIPT_URL.includes("/macros/s/")) {
+      issues.push("URL doesn't appear to be a deployed Google Apps Script URL");
+      suggestions.push(
+        "Make sure you're using the deployed web app URL, not the editor URL"
+      );
+    }
+
+    if (!CONFIG.APPS_SCRIPT_URL.endsWith("/exec")) {
+      issues.push("URL doesn't end with '/exec'");
+      suggestions.push("The deployed web app URL should end with '/exec'");
+    }
+
+    if (CONFIG.APPS_SCRIPT_URL.includes("YOUR_ACTUAL_SCRIPT_ID")) {
+      issues.push("Script ID placeholder hasn't been replaced");
+      suggestions.push(
+        "Replace 'YOUR_ACTUAL_SCRIPT_ID' with your actual script ID from deployment"
+      );
+    }
+
+    // Try to access the URL
+    try {
+      const response = await fetch(CONFIG.APPS_SCRIPT_URL, {
+        method: "GET",
+        headers: { Accept: "application/json" },
+      });
+
+      const contentType = response.headers.get("content-type");
+
+      if (!contentType || !contentType.includes("application/json")) {
+        issues.push(`Script returns ${contentType} instead of JSON`);
+        suggestions.push(
+          "Check if the script is deployed properly as a web app"
+        );
+        suggestions.push(
+          "Verify 'Execute as: Me' and 'Who has access: Anyone' settings"
+        );
+      }
+
+      if (response.status === 403) {
+        issues.push("Access forbidden");
+        suggestions.push(
+          "Check script permissions - set 'Who has access' to 'Anyone'"
+        );
+      }
+    } catch (error) {
+      issues.push(`Network error: ${error}`);
+      suggestions.push("Check your internet connection and script URL");
+    }
+
+    return {
+      isValid: issues.length === 0,
+      issues,
+      suggestions,
+    };
   }
 
   getConnectionStatus(): ConnectionStatus {
@@ -703,6 +793,15 @@ class DieselServiceClass {
     retryCount: number = 0
   ): Promise<ApiResponse<T>> {
     try {
+      if (DEBUG_MODE) {
+        console.log(`🔍 Making request to: ${url}`);
+        console.log(`📤 Request options:`, {
+          method: options.method || "GET",
+          headers: options.headers,
+          body: options.body ? "Present" : "None",
+        });
+      }
+
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), CONFIG.TIMEOUT);
 
@@ -718,11 +817,42 @@ class DieselServiceClass {
 
       clearTimeout(timeoutId);
 
+      if (DEBUG_MODE) {
+        console.log(
+          `📥 Response status: ${response.status} ${response.statusText}`
+        );
+        console.log(
+          `📥 Response headers:`,
+          Object.fromEntries(response.headers.entries())
+        );
+      }
+
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       }
 
+      // Check content type
+      const contentType = response.headers.get("content-type");
+      if (!contentType || !contentType.includes("application/json")) {
+        console.error(`❌ Invalid content type: ${contentType}`);
+
+        // Get the response text for debugging
+        const responseText = await response.text();
+        console.error(
+          `📄 Response body (first 500 chars):`,
+          responseText.substring(0, 500)
+        );
+
+        throw new Error(
+          `Expected JSON response but got: ${contentType}. This usually means the script URL is incorrect or the script is not deployed properly.`
+        );
+      }
+
       const data: ApiResponse<T> = await response.json();
+
+      if (DEBUG_MODE) {
+        console.log(`✅ Parsed JSON response:`, data);
+      }
 
       // Update connection status on successful request
       if (!this.connectionStatus.isConnected) {
@@ -737,6 +867,18 @@ class DieselServiceClass {
       return data;
     } catch (error) {
       console.error(`💥 Request failed (attempt ${retryCount + 1}):`, error);
+
+      // Enhanced error logging
+      if (error instanceof TypeError && error.message.includes("JSON")) {
+        console.error(`🚨 JSON Parse Error - This usually means:
+1. Wrong URL (using editor URL instead of deployed web app URL)
+2. Script not deployed as web app
+3. Script permissions not set correctly
+4. CORS issues
+
+Current URL: ${url}
+Make sure you're using the deployed web app URL ending with '/exec'`);
+      }
 
       // Update connection status on failed request
       this.connectionStatus.isConnected = false;
