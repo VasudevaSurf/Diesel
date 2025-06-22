@@ -1,4 +1,5 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import * as Network from "expo-network";
 
 // Configuration
 const CONFIG = {
@@ -6,9 +7,12 @@ const CONFIG = {
     "https://script.google.com/macros/s/AKfycbxTxoF5X74IzzAG_tX_00A7EKURPPzrbYBuLOX45eg_WNNXXOKZJ7vl9gQ8mgN8kmAo/exec",
   ADMIN_PASSWORD: "admin123",
   INVENTORY_PASSWORD: "inventory456",
-  TIMEOUT: 30000, // 30 seconds
+  TIMEOUT: 15000, // Reduced to 15 seconds for better UX
   RETRY_ATTEMPTS: 3,
   CACHE_DURATION: 5 * 60 * 1000, // 5 minutes
+  SYNC_INTERVAL: 30000, // 30 seconds
+  CONNECTION_CHECK_INTERVAL: 10000, // 10 seconds
+  PING_CHECK_INTERVAL: 5000, // 5 seconds for quick ping checks
 };
 
 // Storage Keys
@@ -19,6 +23,10 @@ const STORAGE_KEYS = {
   CONNECTION_STATUS: "@diesel_tracker:connection_status",
   LAST_SYNC: "@diesel_tracker:last_sync",
   USER_SETTINGS: "@diesel_tracker:user_settings",
+  OFFLINE_QUEUE: "@diesel_tracker:offline_queue",
+  PENDING_ENTRIES: "@diesel_tracker:pending_entries",
+  PENDING_INVENTORY: "@diesel_tracker:pending_inventory",
+  PENDING_MACHINES: "@diesel_tracker:pending_machines",
 };
 
 // Types
@@ -73,6 +81,16 @@ export interface InventoryEntry {
   updatedAt?: string;
 }
 
+export interface QueuedItem {
+  id: string;
+  type: "entry" | "inventory" | "machine" | "machineUpdate";
+  data: any;
+  timestamp: string;
+  retryCount: number;
+  maxRetries: number;
+  priority: number; // Higher = more priority
+}
+
 export interface AlertData {
   overConsumption: OverConsumptionAlert[];
   idleMachines: IdleMachineAlert[];
@@ -96,18 +114,6 @@ export interface IdleMachineAlert {
   severity: "low" | "medium" | "high";
 }
 
-export interface MismatchData {
-  machine: string;
-  standardAvg: number;
-  actualAvg: number;
-  consumptionMismatch: number;
-  status: string;
-  expectedHours: number;
-  actualHours: number;
-  hoursMismatch: number;
-  machineType: string;
-}
-
 export interface ApiResponse<T = any> {
   success: boolean;
   message?: string;
@@ -117,70 +123,226 @@ export interface ApiResponse<T = any> {
   currentStock?: number;
   transactions?: InventoryEntry[];
   alerts?: AlertData;
-  mismatchData?: MismatchData[];
   imageURL?: string;
   error?: string;
   timestamp?: string;
 }
 
-export interface SummaryStats {
-  totalMachines: number;
-  totalDiesel: number;
-  totalUsage: number;
-  avgEfficiency: {
-    lhr?: number;
-    kml?: number;
-    combined?: string;
-  };
-  totalEntries: number;
-  activeAlerts: number;
-  lastUpdated: string;
-}
-
 export interface ConnectionStatus {
   isConnected: boolean;
+  isInternetReachable: boolean;
   lastChecked: string;
   latency?: number;
   error?: string;
+  networkType?: string;
+  networkState?: string;
 }
 
 class DieselServiceClass {
   private connectionStatus: ConnectionStatus = {
     isConnected: false,
+    isInternetReachable: false,
     lastChecked: new Date().toISOString(),
   };
-  private retryQueue: Array<() => Promise<any>> = [];
-  private isRetrying: boolean = false;
+
+  private offlineQueue: QueuedItem[] = [];
+  private isProcessingQueue: boolean = false;
+  private syncInterval: NodeJS.Timeout | null = null;
+  private connectionCheckInterval: NodeJS.Timeout | null = null;
+  private quickPingInterval: NodeJS.Timeout | null = null;
+  private lastNetworkState: any = null;
 
   constructor() {
     this.initializeService();
   }
 
-  // Initialize service
+  // Initialize service with enhanced connection monitoring
   private async initializeService(): Promise<void> {
     try {
-      // Load cached connection status
+      console.log("🚀 Initializing DieselService...");
+
+      // Load cached data
+      await this.loadCachedData();
+
+      // Start network monitoring
+      this.startNetworkMonitoring();
+
+      // Start connection checking
+      this.startConnectionChecking();
+
+      // Start auto-sync
+      this.startAutoSync();
+
+      // Initial connection check
+      this.checkConnection();
+
+      console.log("✅ DieselService initialized successfully");
+    } catch (error) {
+      console.error("❌ Failed to initialize service:", error);
+    }
+  }
+
+  private async loadCachedData(): Promise<void> {
+    try {
+      // Load connection status
       const cachedStatus = await this.getCachedData<ConnectionStatus>(
         STORAGE_KEYS.CONNECTION_STATUS
       );
       if (cachedStatus) {
         this.connectionStatus = cachedStatus;
+        console.log(
+          "📱 Loaded cached connection status:",
+          this.connectionStatus
+        );
       }
 
-      // Check connection in background
-      this.checkConnection().catch((error) => {
-        console.warn("Initial connection check failed:", error);
-      });
+      // Load offline queue
+      const cachedQueue = await this.getCachedData<QueuedItem[]>(
+        STORAGE_KEYS.OFFLINE_QUEUE
+      );
+      if (cachedQueue) {
+        this.offlineQueue = cachedQueue;
+        console.log(
+          `📦 Loaded offline queue with ${this.offlineQueue.length} items`
+        );
+      }
     } catch (error) {
-      console.error("Failed to initialize service:", error);
+      console.error("❌ Failed to load cached data:", error);
     }
   }
 
-  // Connection Management
+  // Enhanced network monitoring using Expo Network
+  private startNetworkMonitoring(): void {
+    console.log("🌐 Starting network monitoring...");
+
+    // Check network state periodically using a more aggressive approach
+    this.quickPingInterval = setInterval(async () => {
+      try {
+        const networkState = await Network.getNetworkStateAsync();
+
+        // Check if network state changed
+        const currentStateKey = `${networkState.type}_${networkState.isConnected}_${networkState.isInternetReachable}`;
+        const lastStateKey = this.lastNetworkState
+          ? `${this.lastNetworkState.type}_${this.lastNetworkState.isConnected}_${this.lastNetworkState.isInternetReachable}`
+          : null;
+
+        if (currentStateKey !== lastStateKey) {
+          console.log("🔄 Network state changed:", {
+            from: this.lastNetworkState,
+            to: networkState,
+          });
+
+          const wasInternetReachable =
+            this.connectionStatus.isInternetReachable;
+
+          this.connectionStatus = {
+            ...this.connectionStatus,
+            isInternetReachable: networkState.isInternetReachable ?? false,
+            networkType: networkState.type,
+            networkState: currentStateKey,
+            lastChecked: new Date().toISOString(),
+          };
+
+          // If internet was restored, check backend and process queue
+          if (!wasInternetReachable && networkState.isInternetReachable) {
+            console.log("🌟 Internet connection restored!");
+
+            // Check backend connection
+            setTimeout(() => {
+              this.checkBackendConnection().then((isBackendConnected) => {
+                if (isBackendConnected && this.offlineQueue.length > 0) {
+                  console.log(
+                    "⚡ Processing offline queue after connection restored..."
+                  );
+                  this.processOfflineQueue();
+                }
+              });
+            }, 1000); // Small delay to ensure connection is stable
+          }
+
+          // Cache the updated status
+          this.cacheData(STORAGE_KEYS.CONNECTION_STATUS, this.connectionStatus);
+          this.lastNetworkState = networkState;
+        }
+      } catch (error) {
+        console.error("❌ Error checking network state:", error);
+      }
+    }, CONFIG.PING_CHECK_INTERVAL);
+  }
+
+  private startConnectionChecking(): void {
+    this.connectionCheckInterval = setInterval(async () => {
+      if (this.connectionStatus.isInternetReachable) {
+        await this.checkBackendConnection();
+      }
+    }, CONFIG.CONNECTION_CHECK_INTERVAL);
+  }
+
+  private startAutoSync(): void {
+    this.syncInterval = setInterval(async () => {
+      if (this.connectionStatus.isConnected && this.offlineQueue.length > 0) {
+        console.log("🔄 Auto-sync: Processing offline queue...");
+        await this.processOfflineQueue();
+      }
+    }, CONFIG.SYNC_INTERVAL);
+  }
+
+  // Enhanced connection checking
   async checkConnection(): Promise<boolean> {
+    console.log("🔍 Checking connection...");
+
+    try {
+      // First check internet connectivity using Expo Network
+      const networkState = await Network.getNetworkStateAsync();
+
+      console.log("📶 Network state:", networkState);
+
+      if (!networkState.isInternetReachable) {
+        this.connectionStatus = {
+          ...this.connectionStatus,
+          isConnected: false,
+          isInternetReachable: false,
+          lastChecked: new Date().toISOString(),
+          error: "No internet connection",
+          networkType: networkState.type,
+        };
+        await this.cacheData(
+          STORAGE_KEYS.CONNECTION_STATUS,
+          this.connectionStatus
+        );
+        console.log("❌ No internet connection");
+        return false;
+      }
+
+      // Update internet status
+      this.connectionStatus.isInternetReachable = true;
+      this.connectionStatus.networkType = networkState.type;
+
+      // Now check backend connection
+      return await this.checkBackendConnection();
+    } catch (error) {
+      console.error("❌ Connection check failed:", error);
+      this.connectionStatus = {
+        ...this.connectionStatus,
+        isConnected: false,
+        isInternetReachable: false,
+        lastChecked: new Date().toISOString(),
+        error: error instanceof Error ? error.message : "Unknown error",
+      };
+      await this.cacheData(
+        STORAGE_KEYS.CONNECTION_STATUS,
+        this.connectionStatus
+      );
+      return false;
+    }
+  }
+
+  private async checkBackendConnection(): Promise<boolean> {
     const startTime = Date.now();
 
     try {
+      console.log("🔗 Checking backend connection...");
+
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), CONFIG.TIMEOUT);
 
@@ -200,26 +362,30 @@ class DieselServiceClass {
       const latency = Date.now() - startTime;
 
       if (response.ok) {
-        let isValid = true;
-        try {
-          const data: ApiResponse = await response.json();
-          isValid = data.success !== false;
-        } catch {
-          // If response is not JSON, still consider it connected if status is OK
-          isValid = true;
-        }
+        console.log(`✅ Backend connected (${latency}ms)`);
+
+        const wasConnected = this.connectionStatus.isConnected;
 
         this.connectionStatus = {
-          isConnected: isValid,
+          ...this.connectionStatus,
+          isConnected: true,
           lastChecked: new Date().toISOString(),
           latency,
+          error: undefined,
         };
 
         await this.cacheData(
           STORAGE_KEYS.CONNECTION_STATUS,
           this.connectionStatus
         );
-        return isValid;
+
+        // If we just connected and have items in queue, process them
+        if (!wasConnected && this.offlineQueue.length > 0) {
+          console.log("🚀 Backend connection restored, processing queue...");
+          setTimeout(() => this.processOfflineQueue(), 500);
+        }
+
+        return true;
       }
 
       throw new Error(`HTTP ${response.status}: ${response.statusText}`);
@@ -227,7 +393,10 @@ class DieselServiceClass {
       const errorMessage =
         error instanceof Error ? error.message : "Unknown error";
 
+      console.log(`❌ Backend connection failed: ${errorMessage}`);
+
       this.connectionStatus = {
+        ...this.connectionStatus,
         isConnected: false,
         lastChecked: new Date().toISOString(),
         error: errorMessage,
@@ -237,7 +406,6 @@ class DieselServiceClass {
         STORAGE_KEYS.CONNECTION_STATUS,
         this.connectionStatus
       );
-      console.warn("Connection check failed:", errorMessage);
       return false;
     }
   }
@@ -246,7 +414,289 @@ class DieselServiceClass {
     return this.connectionStatus;
   }
 
-  // API Request with retry logic
+  // Enhanced offline queue management
+  private async addToOfflineQueue(
+    type: QueuedItem["type"],
+    data: any,
+    priority: number = 1,
+    maxRetries: number = 5
+  ): Promise<string> {
+    const queueItem: QueuedItem = {
+      id: `${type}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      type,
+      data,
+      timestamp: new Date().toISOString(),
+      retryCount: 0,
+      maxRetries,
+      priority,
+    };
+
+    this.offlineQueue.push(queueItem);
+
+    // Sort by priority (higher first) and then by timestamp
+    this.offlineQueue.sort((a, b) => {
+      if (a.priority !== b.priority) {
+        return b.priority - a.priority;
+      }
+      return new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime();
+    });
+
+    await this.cacheData(STORAGE_KEYS.OFFLINE_QUEUE, this.offlineQueue);
+
+    console.log(
+      `📝 Added ${type} to offline queue. Queue size: ${this.offlineQueue.length}`
+    );
+
+    // Try to process immediately if connected
+    if (
+      this.connectionStatus.isConnected &&
+      this.connectionStatus.isInternetReachable
+    ) {
+      console.log("⚡ Attempting immediate processing...");
+      setTimeout(() => this.processOfflineQueue(), 100);
+    }
+
+    return queueItem.id;
+  }
+
+  private async processOfflineQueue(): Promise<void> {
+    if (this.isProcessingQueue || this.offlineQueue.length === 0) {
+      return;
+    }
+
+    if (
+      !this.connectionStatus.isConnected ||
+      !this.connectionStatus.isInternetReachable
+    ) {
+      console.log("⏸️ Cannot process queue: no connection");
+      return;
+    }
+
+    this.isProcessingQueue = true;
+    console.log(
+      `🔄 Processing offline queue with ${this.offlineQueue.length} items...`
+    );
+
+    try {
+      const processedItems: string[] = [];
+      const failedItems: QueuedItem[] = [];
+      let successCount = 0;
+
+      for (const item of this.offlineQueue) {
+        try {
+          console.log(
+            `⚙️ Processing queued ${item.type} (attempt ${
+              item.retryCount + 1
+            }/${item.maxRetries})`
+          );
+
+          let success = false;
+
+          switch (item.type) {
+            case "entry":
+              success = await this.processQueuedEntry(item.data);
+              break;
+            case "inventory":
+              success = await this.processQueuedInventory(item.data);
+              break;
+            case "machine":
+              success = await this.processQueuedMachine(item.data);
+              break;
+            case "machineUpdate":
+              success = await this.processQueuedMachineUpdate(item.data);
+              break;
+            default:
+              console.warn(`❓ Unknown queue item type: ${item.type}`);
+              success = true; // Remove unknown types
+          }
+
+          if (success) {
+            processedItems.push(item.id);
+            successCount++;
+            console.log(`✅ Successfully processed ${item.type} ${item.id}`);
+          } else {
+            item.retryCount++;
+            if (item.retryCount >= item.maxRetries) {
+              console.error(
+                `🚫 Max retries reached for ${item.type} ${item.id}, removing from queue`
+              );
+              processedItems.push(item.id);
+            } else {
+              failedItems.push(item);
+              console.warn(
+                `⚠️ Failed to process ${item.type} ${item.id}, will retry later (${item.retryCount}/${item.maxRetries})`
+              );
+            }
+          }
+        } catch (error) {
+          console.error(`❌ Error processing queue item ${item.id}:`, error);
+          item.retryCount++;
+          if (item.retryCount < item.maxRetries) {
+            failedItems.push(item);
+          } else {
+            processedItems.push(item.id);
+          }
+        }
+      }
+
+      // Remove processed items from queue
+      this.offlineQueue = this.offlineQueue.filter(
+        (item) => !processedItems.includes(item.id)
+      );
+
+      // Add failed items back with updated retry count
+      this.offlineQueue = [...failedItems, ...this.offlineQueue];
+
+      await this.cacheData(STORAGE_KEYS.OFFLINE_QUEUE, this.offlineQueue);
+
+      console.log(
+        `✨ Queue processing complete. Processed: ${successCount}, Failed: ${failedItems.length}, Remaining: ${this.offlineQueue.length}`
+      );
+    } catch (error) {
+      console.error("💥 Error processing offline queue:", error);
+    } finally {
+      this.isProcessingQueue = false;
+    }
+  }
+
+  private async processQueuedEntry(entryData: DieselEntry): Promise<boolean> {
+    try {
+      const response = await this.makeRequest(CONFIG.APPS_SCRIPT_URL, {
+        method: "POST",
+        body: JSON.stringify({
+          action: "submitEntryEnhanced",
+          ...entryData,
+          timestamp: Date.now(),
+        }),
+      });
+
+      if (response.success) {
+        // Update machine's last reading
+        const machines = await this.getMachines();
+        const machine = machines.find((m) => m.name === entryData.machineName);
+        if (machine) {
+          machine.lastReading = entryData.endReading;
+          machine.updatedAt = new Date().toISOString();
+          await this.cacheData(STORAGE_KEYS.MACHINES, machines);
+        }
+
+        // Update local logs cache
+        const logs =
+          (await this.getCachedData<DieselEntry[]>(STORAGE_KEYS.LOGS)) || [];
+        const existingIndex = logs.findIndex((log) => log.id === entryData.id);
+        if (existingIndex === -1) {
+          logs.unshift(entryData);
+          await this.cacheData(STORAGE_KEYS.LOGS, logs.slice(0, 1000));
+        }
+
+        return true;
+      }
+
+      return false;
+    } catch (error) {
+      console.error("❌ Error processing queued entry:", error);
+      return false;
+    }
+  }
+
+  private async processQueuedInventory(
+    inventoryData: InventoryEntry
+  ): Promise<boolean> {
+    try {
+      const params = new URLSearchParams({
+        action: "addInventory",
+        litersReceived: inventoryData.litersReceived.toString(),
+        receiptNumber: inventoryData.receiptNumber || "",
+        remarks: inventoryData.remarks || "",
+        receiptImage: inventoryData.receiptImage || "",
+        phoneNumber: inventoryData.phoneNumber,
+        timestamp: Date.now().toString(),
+      });
+
+      const response = await this.makeRequest(
+        `${CONFIG.APPS_SCRIPT_URL}?${params}`
+      );
+
+      if (response.success) {
+        return true;
+      }
+
+      return false;
+    } catch (error) {
+      console.error("❌ Error processing queued inventory:", error);
+      return false;
+    }
+  }
+
+  private async processQueuedMachine(
+    machineData: Omit<Machine, "lastReading" | "id">
+  ): Promise<boolean> {
+    try {
+      const params = new URLSearchParams({
+        action: "addMachineEnhanced",
+        machineName: machineData.name,
+        machinePlate: machineData.plate,
+        machineType: machineData.machineType || "L/hr",
+        ownershipType: machineData.ownershipType || "Own",
+        initialReading: (machineData.initialReading || 0).toString(),
+        standardAvgDiesel: (machineData.standardAvgDiesel || 0).toString(),
+        expectedDailyHours: (machineData.expectedDailyHours || 0).toString(),
+        doorNo: machineData.doorNo || "",
+        remarks: machineData.remarks || "",
+        dateAdded:
+          machineData.dateAdded || new Date().toISOString().split("T")[0],
+        timestamp: Date.now().toString(),
+      });
+
+      const response = await this.makeRequest(
+        `${CONFIG.APPS_SCRIPT_URL}?${params}`
+      );
+
+      if (response.success) {
+        return true;
+      }
+
+      return false;
+    } catch (error) {
+      console.error("❌ Error processing queued machine:", error);
+      return false;
+    }
+  }
+
+  private async processQueuedMachineUpdate(updateData: {
+    machineName: string;
+    updates: Partial<Machine>;
+  }): Promise<boolean> {
+    try {
+      const params = new URLSearchParams({
+        action: "editMachine",
+        oldName: updateData.machineName,
+        ...Object.entries(updateData.updates).reduce((acc, [key, value]) => {
+          if (value !== undefined && value !== null) {
+            acc[key] = value.toString();
+          }
+          return acc;
+        }, {} as Record<string, string>),
+        updatedAt: new Date().toISOString(),
+        timestamp: Date.now().toString(),
+      });
+
+      const response = await this.makeRequest(
+        `${CONFIG.APPS_SCRIPT_URL}?${params}`
+      );
+
+      if (response.success) {
+        return true;
+      }
+
+      return false;
+    } catch (error) {
+      console.error("❌ Error processing queued machine update:", error);
+      return false;
+    }
+  }
+
+  // Enhanced API request with better error handling
   private async makeRequest<T>(
     url: string,
     options: RequestInit = {},
@@ -275,7 +725,7 @@ class DieselServiceClass {
       const data: ApiResponse<T> = await response.json();
 
       // Update connection status on successful request
-      if (this.connectionStatus.isConnected === false) {
+      if (!this.connectionStatus.isConnected) {
         this.connectionStatus.isConnected = true;
         this.connectionStatus.lastChecked = new Date().toISOString();
         await this.cacheData(
@@ -286,7 +736,7 @@ class DieselServiceClass {
 
       return data;
     } catch (error) {
-      console.error(`Request failed (attempt ${retryCount + 1}):`, error);
+      console.error(`💥 Request failed (attempt ${retryCount + 1}):`, error);
 
       // Update connection status on failed request
       this.connectionStatus.isConnected = false;
@@ -297,6 +747,7 @@ class DieselServiceClass {
       // Retry logic
       if (retryCount < CONFIG.RETRY_ATTEMPTS - 1) {
         const delay = Math.pow(2, retryCount) * 1000; // Exponential backoff
+        console.log(`⏳ Retrying in ${delay}ms...`);
         await new Promise((resolve) => setTimeout(resolve, delay));
         return this.makeRequest<T>(url, options, retryCount + 1);
       }
@@ -305,197 +756,11 @@ class DieselServiceClass {
     }
   }
 
-  // Machine Management
-  async getMachines(): Promise<Machine[]> {
-    try {
-      if (!this.connectionStatus.isConnected) {
-        return this.getMockMachines();
-      }
-
-      const response = await this.makeRequest<{ machines: Machine[] }>(
-        `${CONFIG.APPS_SCRIPT_URL}?action=getMachines&timestamp=${Date.now()}`
-      );
-
-      if (response.success && response.machines) {
-        await this.cacheData(STORAGE_KEYS.MACHINES, response.machines);
-        return response.machines;
-      } else {
-        throw new Error(response.message || "Failed to fetch machines");
-      }
-    } catch (error) {
-      console.error("Error fetching machines:", error);
-
-      // Try to return cached data
-      const cached = await this.getCachedData<Machine[]>(STORAGE_KEYS.MACHINES);
-      if (cached && cached.length > 0) {
-        return cached;
-      }
-
-      return this.getMockMachines();
-    }
-  }
-
-  async addMachine(
-    machine: Omit<Machine, "lastReading" | "id">
-  ): Promise<ApiResponse> {
-    try {
-      if (!this.connectionStatus.isConnected) {
-        return {
-          success: false,
-          message:
-            "Demo mode - machine not saved to backend. Please check your internet connection.",
-        };
-      }
-
-      // Add timestamp and generate ID
-      const machineWithMeta = {
-        ...machine,
-        id: `machine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        lastReading: machine.initialReading || 0,
-      };
-
-      const params = new URLSearchParams({
-        action: "addMachineEnhanced",
-        machineName: machine.name,
-        machinePlate: machine.plate,
-        machineType: machine.machineType || "L/hr",
-        ownershipType: machine.ownershipType || "Own",
-        initialReading: (machine.initialReading || 0).toString(),
-        standardAvgDiesel: (machine.standardAvgDiesel || 0).toString(),
-        expectedDailyHours: (machine.expectedDailyHours || 0).toString(),
-        doorNo: machine.doorNo || "",
-        remarks: machine.remarks || "",
-        dateAdded: machine.dateAdded || new Date().toISOString().split("T")[0],
-        timestamp: Date.now().toString(),
-      });
-
-      const response = await this.makeRequest<Machine>(
-        `${CONFIG.APPS_SCRIPT_URL}?${params}`
-      );
-
-      if (response.success) {
-        // Update local cache
-        const machines = await this.getMachines();
-        machines.push(machineWithMeta);
-        await this.cacheData(STORAGE_KEYS.MACHINES, machines);
-      }
-
-      return response;
-    } catch (error) {
-      console.error("Error adding machine:", error);
-      return {
-        success: false,
-        message: `Failed to add machine: ${
-          error instanceof Error ? error.message : "Unknown error"
-        }`,
-      };
-    }
-  }
-
-  async updateMachine(
-    machineName: string,
-    updates: Partial<Machine>
-  ): Promise<ApiResponse> {
-    try {
-      if (!this.connectionStatus.isConnected) {
-        return {
-          success: false,
-          message: "Demo mode - machine update not saved to backend",
-        };
-      }
-
-      const params = new URLSearchParams({
-        action: "editMachine",
-        oldName: machineName,
-        ...Object.entries(updates).reduce((acc, [key, value]) => {
-          if (value !== undefined && value !== null) {
-            acc[key] = value.toString();
-          }
-          return acc;
-        }, {} as Record<string, string>),
-        updatedAt: new Date().toISOString(),
-        timestamp: Date.now().toString(),
-      });
-
-      const response = await this.makeRequest(
-        `${CONFIG.APPS_SCRIPT_URL}?${params}`
-      );
-
-      if (response.success) {
-        // Update local cache
-        const machines = await this.getMachines();
-        const index = machines.findIndex((m) => m.name === machineName);
-        if (index !== -1) {
-          machines[index] = {
-            ...machines[index],
-            ...updates,
-            updatedAt: new Date().toISOString(),
-          };
-          await this.cacheData(STORAGE_KEYS.MACHINES, machines);
-        }
-      }
-
-      return response;
-    } catch (error) {
-      console.error("Error updating machine:", error);
-      return {
-        success: false,
-        message: `Failed to update machine: ${
-          error instanceof Error ? error.message : "Unknown error"
-        }`,
-      };
-    }
-  }
-
-  async deleteMachine(machineName: string): Promise<ApiResponse> {
-    try {
-      if (!this.connectionStatus.isConnected) {
-        return {
-          success: false,
-          message: "Demo mode - machine deletion not saved to backend",
-        };
-      }
-
-      const response = await this.makeRequest(
-        `${
-          CONFIG.APPS_SCRIPT_URL
-        }?action=deleteMachine&machineName=${encodeURIComponent(
-          machineName
-        )}&timestamp=${Date.now()}`
-      );
-
-      if (response.success) {
-        // Update local cache
-        const machines = await this.getMachines();
-        const filteredMachines = machines.filter((m) => m.name !== machineName);
-        await this.cacheData(STORAGE_KEYS.MACHINES, filteredMachines);
-      }
-
-      return response;
-    } catch (error) {
-      console.error("Error deleting machine:", error);
-      return {
-        success: false,
-        message: `Failed to delete machine: ${
-          error instanceof Error ? error.message : "Unknown error"
-        }`,
-      };
-    }
-  }
-
-  // Diesel Entry Management
+  // Enhanced submission methods with immediate local updates and queue management
   async submitEntry(entry: DieselEntry): Promise<ApiResponse> {
-    try {
-      if (!this.connectionStatus.isConnected) {
-        return {
-          success: false,
-          message:
-            "Demo mode - entry not saved to backend. Data will be saved when connection is restored.",
-        };
-      }
+    console.log("📝 Submitting diesel entry...");
 
+    try {
       // Calculate additional fields
       const usage = entry.endReading - entry.startReading;
       const machine = (await this.getMachines()).find(
@@ -509,56 +774,92 @@ class DieselServiceClass {
         rate = usage > 0 ? entry.dieselFilled / usage : 0;
       }
 
-      const consumptionMismatch = machine?.standardAvgDiesel
-        ? rate - machine.standardAvgDiesel
-        : 0;
-      const hoursMismatch = machine?.expectedDailyHours
-        ? usage - machine.expectedDailyHours
-        : 0;
-
       const entryWithCalculations = {
         ...entry,
-        id: `entry_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        id:
+          entry.id ||
+          `entry_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
         usage,
         rate,
-        consumptionMismatch,
-        hoursMismatch,
-        standardAvg: machine?.standardAvgDiesel || 0,
-        expectedDaily: machine?.expectedDailyHours || 0,
         machineType: machine?.machineType || "L/hr",
-        timestamp: new Date().toISOString(),
-        createdAt: new Date().toISOString(),
+        timestamp: entry.timestamp || new Date().toISOString(),
+        createdAt: entry.createdAt || new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
 
-      const response = await this.makeRequest(CONFIG.APPS_SCRIPT_URL, {
-        method: "POST",
-        body: JSON.stringify({
-          action: "submitEntryEnhanced",
-          ...entryWithCalculations,
-          timestamp: Date.now(),
-        }),
-      });
-
-      if (response.success) {
-        // Update machine's last reading
-        if (machine) {
-          await this.updateMachine(entry.machineName, {
-            lastReading: entry.endReading,
-            updatedAt: new Date().toISOString(),
-          });
-        }
-
-        // Update local logs cache
-        const logs =
-          (await this.getCachedData<DieselEntry[]>(STORAGE_KEYS.LOGS)) || [];
+      // Update local cache immediately for better UX
+      const logs =
+        (await this.getCachedData<DieselEntry[]>(STORAGE_KEYS.LOGS)) || [];
+      const existingIndex = logs.findIndex(
+        (log) => log.id === entryWithCalculations.id
+      );
+      if (existingIndex === -1) {
         logs.unshift(entryWithCalculations);
-        await this.cacheData(STORAGE_KEYS.LOGS, logs.slice(0, 1000)); // Keep last 1000 entries
+        await this.cacheData(STORAGE_KEYS.LOGS, logs.slice(0, 1000));
       }
 
-      return response;
+      // Update machine's last reading locally
+      if (machine) {
+        const machines = await this.getMachines();
+        const index = machines.findIndex((m) => m.name === entry.machineName);
+        if (index !== -1) {
+          machines[index].lastReading = entry.endReading;
+          machines[index].updatedAt = new Date().toISOString();
+          await this.cacheData(STORAGE_KEYS.MACHINES, machines);
+        }
+      }
+
+      if (
+        this.connectionStatus.isConnected &&
+        this.connectionStatus.isInternetReachable
+      ) {
+        // Try to submit immediately
+        try {
+          console.log("📡 Attempting immediate submission...");
+
+          const response = await this.makeRequest(CONFIG.APPS_SCRIPT_URL, {
+            method: "POST",
+            body: JSON.stringify({
+              action: "submitEntryEnhanced",
+              ...entryWithCalculations,
+              timestamp: Date.now(),
+            }),
+          });
+
+          if (response.success) {
+            console.log("✅ Entry submitted successfully!");
+            return {
+              success: true,
+              message: "Entry submitted successfully!",
+            };
+          } else {
+            throw new Error(response.message || "Submission failed");
+          }
+        } catch (error) {
+          console.log(
+            "⚠️ Immediate submission failed, queuing for later:",
+            error
+          );
+          // Fall through to queue the entry
+        }
+      }
+
+      // Queue for later submission
+      const queueId = await this.addToOfflineQueue(
+        "entry",
+        entryWithCalculations,
+        5
+      ); // High priority
+      console.log(`📦 Entry queued with ID: ${queueId}`);
+
+      return {
+        success: true,
+        message: this.connectionStatus.isInternetReachable
+          ? "Entry saved locally and will be submitted when backend connection is restored."
+          : "Entry saved locally and queued for submission when online.",
+      };
     } catch (error) {
-      console.error("Error submitting entry:", error);
+      console.error("💥 Error submitting entry:", error);
       return {
         success: false,
         message: `Failed to submit entry: ${
@@ -568,39 +869,374 @@ class DieselServiceClass {
     }
   }
 
-  async submitBackLogEntry(
-    entry: DieselEntry & { entryDate: string }
-  ): Promise<ApiResponse> {
+  async addInventory(inventory: InventoryEntry): Promise<ApiResponse> {
+    console.log("📦 Adding inventory...");
+
     try {
-      if (!this.connectionStatus.isConnected) {
-        return {
-          success: false,
-          message: "Demo mode - back-dated entry not saved to backend",
-        };
+      const inventoryWithMeta = {
+        ...inventory,
+        id:
+          inventory.id ||
+          `inventory_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        type: "IN" as const,
+        timestamp: inventory.timestamp || new Date().toISOString(),
+        createdAt: inventory.createdAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+
+      // Update local cache immediately
+      const currentInventory = await this.getInventory();
+      const existingIndex = currentInventory.transactions.findIndex(
+        (t) => t.id === inventoryWithMeta.id
+      );
+      if (existingIndex === -1) {
+        currentInventory.transactions.unshift(inventoryWithMeta);
+        currentInventory.currentStock += inventory.litersReceived;
+        await this.cacheData(STORAGE_KEYS.INVENTORY, currentInventory);
       }
 
-      const response = await this.makeRequest(CONFIG.APPS_SCRIPT_URL, {
-        method: "POST",
-        body: JSON.stringify({
-          action: "submitBackLog",
-          ...entry,
-          timestamp: Date.now(),
-        }),
-      });
+      if (
+        this.connectionStatus.isConnected &&
+        this.connectionStatus.isInternetReachable
+      ) {
+        // Try to submit immediately
+        try {
+          console.log("📡 Attempting immediate inventory submission...");
 
-      return response;
+          const params = new URLSearchParams({
+            action: "addInventory",
+            litersReceived: inventory.litersReceived.toString(),
+            receiptNumber: inventory.receiptNumber || "",
+            remarks: inventory.remarks || "",
+            receiptImage: inventory.receiptImage || "",
+            phoneNumber: inventory.phoneNumber,
+            timestamp: Date.now().toString(),
+          });
+
+          const response = await this.makeRequest(
+            `${CONFIG.APPS_SCRIPT_URL}?${params}`
+          );
+
+          if (response.success) {
+            console.log("✅ Inventory added successfully!");
+            return {
+              success: true,
+              message: "Inventory added successfully!",
+            };
+          } else {
+            throw new Error(response.message || "Submission failed");
+          }
+        } catch (error) {
+          console.log(
+            "⚠️ Immediate inventory submission failed, queuing for later:",
+            error
+          );
+          // Fall through to queue the entry
+        }
+      }
+
+      // Queue for later submission
+      const queueId = await this.addToOfflineQueue(
+        "inventory",
+        inventoryWithMeta,
+        4
+      ); // High priority
+      console.log(`📦 Inventory queued with ID: ${queueId}`);
+
+      return {
+        success: true,
+        message: this.connectionStatus.isInternetReachable
+          ? "Inventory saved locally and will be submitted when backend connection is restored."
+          : "Inventory saved locally and queued for submission when online.",
+      };
     } catch (error) {
-      console.error("Error submitting back-dated entry:", error);
+      console.error("💥 Error adding inventory:", error);
       return {
         success: false,
-        message: `Failed to submit back-dated entry: ${
+        message: `Failed to add inventory: ${
           error instanceof Error ? error.message : "Unknown error"
         }`,
       };
     }
   }
 
-  // Inventory Management
+  async addMachine(
+    machine: Omit<Machine, "lastReading" | "id">
+  ): Promise<ApiResponse> {
+    console.log("🏗️ Adding machine...");
+
+    try {
+      // Update local cache immediately
+      const machines = await this.getMachines();
+      const machineWithMeta = {
+        ...machine,
+        id: `machine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        lastReading: machine.initialReading || 0,
+      };
+
+      const existingIndex = machines.findIndex(
+        (m) => m.name === machine.name && m.plate === machine.plate
+      );
+      if (existingIndex === -1) {
+        machines.push(machineWithMeta);
+        await this.cacheData(STORAGE_KEYS.MACHINES, machines);
+      }
+
+      if (
+        this.connectionStatus.isConnected &&
+        this.connectionStatus.isInternetReachable
+      ) {
+        // Try to submit immediately
+        try {
+          console.log("📡 Attempting immediate machine submission...");
+
+          const params = new URLSearchParams({
+            action: "addMachineEnhanced",
+            machineName: machine.name,
+            machinePlate: machine.plate,
+            machineType: machine.machineType || "L/hr",
+            ownershipType: machine.ownershipType || "Own",
+            initialReading: (machine.initialReading || 0).toString(),
+            standardAvgDiesel: (machine.standardAvgDiesel || 0).toString(),
+            expectedDailyHours: (machine.expectedDailyHours || 0).toString(),
+            doorNo: machine.doorNo || "",
+            remarks: machine.remarks || "",
+            dateAdded:
+              machine.dateAdded || new Date().toISOString().split("T")[0],
+            timestamp: Date.now().toString(),
+          });
+
+          const response = await this.makeRequest(
+            `${CONFIG.APPS_SCRIPT_URL}?${params}`
+          );
+
+          if (response.success) {
+            console.log("✅ Machine added successfully!");
+            return {
+              success: true,
+              message: "Machine added successfully!",
+            };
+          } else {
+            throw new Error(response.message || "Submission failed");
+          }
+        } catch (error) {
+          console.log(
+            "⚠️ Immediate machine submission failed, queuing for later:",
+            error
+          );
+          // Fall through to queue the entry
+        }
+      }
+
+      // Queue for later submission
+      const queueId = await this.addToOfflineQueue("machine", machine, 3); // Medium priority
+      console.log(`🏗️ Machine queued with ID: ${queueId}`);
+
+      return {
+        success: true,
+        message: this.connectionStatus.isInternetReachable
+          ? "Machine saved locally and will be submitted when backend connection is restored."
+          : "Machine saved locally and queued for submission when online.",
+      };
+    } catch (error) {
+      console.error("💥 Error adding machine:", error);
+      return {
+        success: false,
+        message: `Failed to add machine: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`,
+      };
+    }
+  }
+
+  // Cleanup and status methods
+  getOfflineQueueStatus(): { count: number; items: QueuedItem[] } {
+    return {
+      count: this.offlineQueue.length,
+      items: this.offlineQueue,
+    };
+  }
+
+  async clearOfflineQueue(): Promise<void> {
+    console.log("🗑️ Clearing offline queue...");
+    this.offlineQueue = [];
+    await this.cacheData(STORAGE_KEYS.OFFLINE_QUEUE, this.offlineQueue);
+  }
+
+  async retryFailedItems(): Promise<void> {
+    console.log("🔄 Manual retry requested...");
+    if (
+      this.connectionStatus.isConnected &&
+      this.connectionStatus.isInternetReachable
+    ) {
+      await this.processOfflineQueue();
+    } else {
+      console.log("⚠️ Cannot retry: no connection");
+    }
+  }
+
+  // Cleanup on app close
+  destroy(): void {
+    console.log("🧹 Cleaning up DieselService...");
+
+    if (this.syncInterval) {
+      clearInterval(this.syncInterval);
+    }
+    if (this.connectionCheckInterval) {
+      clearInterval(this.connectionCheckInterval);
+    }
+    if (this.quickPingInterval) {
+      clearInterval(this.quickPingInterval);
+    }
+  }
+
+  // Keep existing methods for getting data
+  async getMachines(): Promise<Machine[]> {
+    try {
+      if (!this.connectionStatus.isConnected) {
+        const cached = await this.getCachedData<Machine[]>(
+          STORAGE_KEYS.MACHINES
+        );
+        return cached || this.getMockMachines();
+      }
+
+      const response = await this.makeRequest<{ machines: Machine[] }>(
+        `${CONFIG.APPS_SCRIPT_URL}?action=getMachines&timestamp=${Date.now()}`
+      );
+
+      if (response.success && response.machines) {
+        await this.cacheData(STORAGE_KEYS.MACHINES, response.machines);
+        return response.machines;
+      } else {
+        throw new Error(response.message || "Failed to fetch machines");
+      }
+    } catch (error) {
+      console.error("❌ Error fetching machines:", error);
+
+      // Try to return cached data
+      const cached = await this.getCachedData<Machine[]>(STORAGE_KEYS.MACHINES);
+      if (cached && cached.length > 0) {
+        return cached;
+      }
+
+      return this.getMockMachines();
+    }
+  }
+
+  async updateMachine(
+    machineName: string,
+    updates: Partial<Machine>
+  ): Promise<ApiResponse> {
+    try {
+      // Update local cache immediately
+      const machines = await this.getMachines();
+      const index = machines.findIndex((m) => m.name === machineName);
+      if (index !== -1) {
+        machines[index] = {
+          ...machines[index],
+          ...updates,
+          updatedAt: new Date().toISOString(),
+        };
+        await this.cacheData(STORAGE_KEYS.MACHINES, machines);
+      }
+
+      if (
+        this.connectionStatus.isConnected &&
+        this.connectionStatus.isInternetReachable
+      ) {
+        try {
+          const params = new URLSearchParams({
+            action: "editMachine",
+            oldName: machineName,
+            ...Object.entries(updates).reduce((acc, [key, value]) => {
+              if (value !== undefined && value !== null) {
+                acc[key] = value.toString();
+              }
+              return acc;
+            }, {} as Record<string, string>),
+            updatedAt: new Date().toISOString(),
+            timestamp: Date.now().toString(),
+          });
+
+          const response = await this.makeRequest(
+            `${CONFIG.APPS_SCRIPT_URL}?${params}`
+          );
+
+          if (response.success) {
+            return { success: true, message: "Machine updated successfully!" };
+          } else {
+            throw new Error(response.message || "Update failed");
+          }
+        } catch (error) {
+          console.log(
+            "⚠️ Immediate machine update failed, queuing for later:",
+            error
+          );
+          // Fall through to queue the update
+        }
+      }
+
+      // Queue for later submission
+      await this.addToOfflineQueue(
+        "machineUpdate",
+        { machineName, updates },
+        2
+      ); // Medium priority
+
+      return {
+        success: true,
+        message: this.connectionStatus.isInternetReachable
+          ? "Machine updated locally and will be synced when backend connection is restored."
+          : "Machine updated locally and queued for sync when online.",
+      };
+    } catch (error) {
+      console.error("❌ Error updating machine:", error);
+      return {
+        success: false,
+        message: `Failed to update machine: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`,
+      };
+    }
+  }
+
+  // Cache Management
+  async cacheData(key: string, data: any): Promise<void> {
+    try {
+      const cacheEntry = {
+        data,
+        timestamp: Date.now(),
+        expires: Date.now() + CONFIG.CACHE_DURATION,
+      };
+      await AsyncStorage.setItem(key, JSON.stringify(cacheEntry));
+    } catch (error) {
+      console.error("❌ Error caching data:", error);
+    }
+  }
+
+  async getCachedData<T>(key: string): Promise<T | null> {
+    try {
+      const cached = await AsyncStorage.getItem(key);
+      if (!cached) return null;
+
+      const cacheEntry = JSON.parse(cached);
+
+      // Check if cache is still valid
+      if (cacheEntry.expires && Date.now() > cacheEntry.expires) {
+        await AsyncStorage.removeItem(key);
+        return null;
+      }
+
+      return cacheEntry.data;
+    } catch (error) {
+      console.error("❌ Error getting cached data:", error);
+      return null;
+    }
+  }
+
+  // Keep existing methods for inventory, logs, alerts, etc.
   async getInventory(): Promise<{
     currentStock: number;
     transactions: InventoryEntry[];
@@ -611,12 +1247,7 @@ class DieselServiceClass {
           currentStock: number;
           transactions: InventoryEntry[];
         }>(STORAGE_KEYS.INVENTORY);
-        return (
-          cached || {
-            currentStock: 475,
-            transactions: this.getMockInventoryTransactions(),
-          }
-        );
+        return cached || { currentStock: 475, transactions: [] };
       }
 
       const response = await this.makeRequest<{
@@ -638,9 +1269,9 @@ class DieselServiceClass {
         throw new Error(response.message || "Failed to fetch inventory");
       }
     } catch (error) {
-      console.error("Error fetching inventory:", error);
+      console.error("❌ Error fetching inventory:", error);
 
-      // Return cached data or mock data
+      // Return cached data
       const cached = await this.getCachedData<{
         currentStock: number;
         transactions: InventoryEntry[];
@@ -649,61 +1280,6 @@ class DieselServiceClass {
     }
   }
 
-  async addInventory(inventory: InventoryEntry): Promise<ApiResponse> {
-    try {
-      if (!this.connectionStatus.isConnected) {
-        return {
-          success: false,
-          message: "Demo mode - inventory not saved to backend",
-        };
-      }
-
-      const inventoryWithMeta = {
-        ...inventory,
-        id: `inventory_${Date.now()}_${Math.random()
-          .toString(36)
-          .substr(2, 9)}`,
-        type: "IN" as const,
-        timestamp: new Date().toISOString(),
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      };
-
-      const params = new URLSearchParams({
-        action: "addInventory",
-        litersReceived: inventory.litersReceived.toString(),
-        receiptNumber: inventory.receiptNumber || "",
-        remarks: inventory.remarks || "",
-        receiptImage: inventory.receiptImage || "",
-        phoneNumber: inventory.phoneNumber,
-        timestamp: Date.now().toString(),
-      });
-
-      const response = await this.makeRequest(
-        `${CONFIG.APPS_SCRIPT_URL}?${params}`
-      );
-
-      if (response.success) {
-        // Update local cache
-        const currentInventory = await this.getInventory();
-        currentInventory.transactions.unshift(inventoryWithMeta);
-        currentInventory.currentStock += inventory.litersReceived;
-        await this.cacheData(STORAGE_KEYS.INVENTORY, currentInventory);
-      }
-
-      return response;
-    } catch (error) {
-      console.error("Error adding inventory:", error);
-      return {
-        success: false,
-        message: `Failed to add inventory: ${
-          error instanceof Error ? error.message : "Unknown error"
-        }`,
-      };
-    }
-  }
-
-  // Logs and Reports
   async getLogs(filters?: {
     dateFrom?: string;
     dateTo?: string;
@@ -715,7 +1291,7 @@ class DieselServiceClass {
         const cached = await this.getCachedData<DieselEntry[]>(
           STORAGE_KEYS.LOGS
         );
-        return { logs: cached || this.getMockLogs(), success: true };
+        return { logs: cached || [], success: true };
       }
 
       let url = `${
@@ -734,14 +1310,13 @@ class DieselServiceClass {
       const response = await this.makeRequest<{ logs: DieselEntry[] }>(url);
 
       if (response.success && response.logs) {
-        // Cache the results
         await this.cacheData(STORAGE_KEYS.LOGS, response.logs);
         return { logs: response.logs, success: true };
       } else {
         throw new Error(response.message || "Failed to fetch logs");
       }
     } catch (error) {
-      console.error("Error fetching logs:", error);
+      console.error("❌ Error fetching logs:", error);
 
       // Return cached data
       const cached = await this.getCachedData<DieselEntry[]>(STORAGE_KEYS.LOGS);
@@ -749,140 +1324,42 @@ class DieselServiceClass {
     }
   }
 
-  // Alerts and Analytics
-  async getAlertsData(): Promise<{
-    alerts: AlertData;
-    mismatchData: MismatchData[];
-    success: boolean;
-  }> {
+  async getAlertsData(): Promise<{ alerts: AlertData; success: boolean }> {
     try {
       if (!this.connectionStatus.isConnected) {
         return {
-          alerts: this.getMockAlerts(),
-          mismatchData: this.getMockMismatchData(),
+          alerts: { overConsumption: [], idleMachines: [] },
           success: true,
         };
       }
 
-      const response = await this.makeRequest<{
-        alerts: AlertData;
-        mismatchData: MismatchData[];
-      }>(
+      const response = await this.makeRequest<{ alerts: AlertData }>(
         `${CONFIG.APPS_SCRIPT_URL}?action=getAlertsData&timestamp=${Date.now()}`
       );
 
       if (response.success) {
         return {
           alerts: response.alerts || { overConsumption: [], idleMachines: [] },
-          mismatchData: response.mismatchData || [],
           success: true,
         };
       } else {
         throw new Error(response.message || "Failed to fetch alerts data");
       }
     } catch (error) {
-      console.error("Error fetching alerts:", error);
+      console.error("❌ Error fetching alerts:", error);
       return {
         alerts: { overConsumption: [], idleMachines: [] },
-        mismatchData: [],
         success: false,
       };
     }
   }
 
-  async getSummaryStats(
-    logs?: DieselEntry[],
-    machines?: Machine[]
-  ): Promise<SummaryStats> {
-    try {
-      const logsData = logs || (await this.getLogs()).logs;
-      const machinesData = machines || (await this.getMachines());
-
-      const totalDiesel = logsData.reduce(
-        (sum, log) => sum + (log.dieselFilled || 0),
-        0
-      );
-      const totalUsage = logsData.reduce(
-        (sum, log) => sum + (log.usage || 0),
-        0
-      );
-      const uniqueMachines = new Set(logsData.map((log) => log.machineName))
-        .size;
-
-      // Calculate separate averages for different machine types
-      let totalLHR = 0,
-        countLHR = 0;
-      let totalKML = 0,
-        countKML = 0;
-
-      logsData.forEach((log) => {
-        const type = log.machineType || "L/hr";
-        const rate = parseFloat(log.rate?.toString() || "0");
-
-        if (type === "L/hr") {
-          totalLHR += rate;
-          countLHR++;
-        } else if (type === "L/km" || type === "KM/l") {
-          totalKML += rate;
-          countKML++;
-        }
-      });
-
-      const avgLHR = countLHR > 0 ? totalLHR / countLHR : 0;
-      const avgKML = countKML > 0 ? totalKML / countKML : 0;
-
-      let combinedEfficiency = "";
-      if (avgLHR > 0 && avgKML > 0) {
-        combinedEfficiency = `L/hr: ${avgLHR.toFixed(
-          2
-        )} | KM/l: ${avgKML.toFixed(2)}`;
-      } else if (avgLHR > 0) {
-        combinedEfficiency = `${avgLHR.toFixed(2)} L/hr`;
-      } else if (avgKML > 0) {
-        combinedEfficiency = `${avgKML.toFixed(2)} KM/l`;
-      } else {
-        combinedEfficiency = "--";
-      }
-
-      // Get alerts count
-      const alertsData = await this.getAlertsData();
-      const activeAlerts =
-        alertsData.alerts.overConsumption.length +
-        alertsData.alerts.idleMachines.length;
-
-      return {
-        totalMachines: uniqueMachines,
-        totalDiesel,
-        totalUsage,
-        avgEfficiency: {
-          lhr: avgLHR,
-          kml: avgKML,
-          combined: combinedEfficiency,
-        },
-        totalEntries: logsData.length,
-        activeAlerts,
-        lastUpdated: new Date().toISOString(),
-      };
-    } catch (error) {
-      console.error("Error calculating summary stats:", error);
-      return {
-        totalMachines: 0,
-        totalDiesel: 0,
-        totalUsage: 0,
-        avgEfficiency: { combined: "--" },
-        totalEntries: 0,
-        activeAlerts: 0,
-        lastUpdated: new Date().toISOString(),
-      };
-    }
-  }
-
-  // Image Upload
+  // Image upload
   async uploadImage(imageUri: string, fileName: string): Promise<string> {
     try {
       if (!this.connectionStatus.isConnected) {
-        console.warn("Cannot upload image in demo mode");
-        return ""; // Return empty string for demo mode
+        console.warn("⚠️ Cannot upload image in demo mode");
+        return "";
       }
 
       // Convert image to base64
@@ -919,143 +1396,12 @@ class DieselServiceClass {
         throw new Error(uploadResponse.message || "Upload failed");
       }
     } catch (error) {
-      console.error("Error uploading image:", error);
+      console.error("❌ Error uploading image:", error);
       return "";
     }
   }
 
-  // Utility Functions
-  generateMachineId(machine: Machine): string {
-    return `${machine.name}-${machine.plate}`;
-  }
-
-  generateQRData(machine: Machine, baseUrl?: string): string {
-    const machineId = this.generateMachineId(machine);
-    const url = baseUrl || "dieselpro://entry";
-    return `${url}?machineId=${encodeURIComponent(machineId)}`;
-  }
-
-  calculateMismatch(
-    actualRate: number,
-    standardRate: number,
-    machineType: string = "L/hr"
-  ): { mismatch: number; severity: "low" | "medium" | "high"; status: string } {
-    const mismatch = actualRate - standardRate;
-    const percentageDiff = Math.abs(mismatch / standardRate) * 100;
-
-    let severity: "low" | "medium" | "high" = "low";
-    let status = "Normal";
-
-    if (machineType === "KM/l") {
-      // For KM/l, lower values are worse
-      if (actualRate < standardRate * 0.7) {
-        severity = "high";
-        status = "Poor Efficiency";
-      } else if (actualRate < standardRate * 0.85) {
-        severity = "medium";
-        status = "Below Average";
-      } else {
-        status = "Good Efficiency";
-      }
-    } else {
-      // For L/hr, higher values are worse
-      if (percentageDiff > 30) {
-        severity = "high";
-        status =
-          actualRate > standardRate ? "High Consumption" : "Very Efficient";
-      } else if (percentageDiff > 15) {
-        severity = "medium";
-        status = actualRate > standardRate ? "Above Average" : "Efficient";
-      } else {
-        status = "Normal";
-      }
-    }
-
-    return { mismatch, severity, status };
-  }
-
-  // Cache Management
-  async cacheData(key: string, data: any): Promise<void> {
-    try {
-      const cacheEntry = {
-        data,
-        timestamp: Date.now(),
-        expires: Date.now() + CONFIG.CACHE_DURATION,
-      };
-      await AsyncStorage.setItem(key, JSON.stringify(cacheEntry));
-    } catch (error) {
-      console.error("Error caching data:", error);
-    }
-  }
-
-  async getCachedData<T>(key: string): Promise<T | null> {
-    try {
-      const cached = await AsyncStorage.getItem(key);
-      if (!cached) return null;
-
-      const cacheEntry = JSON.parse(cached);
-
-      // Check if cache is still valid
-      if (cacheEntry.expires && Date.now() > cacheEntry.expires) {
-        await AsyncStorage.removeItem(key);
-        return null;
-      }
-
-      return cacheEntry.data;
-    } catch (error) {
-      console.error("Error getting cached data:", error);
-      return null;
-    }
-  }
-
-  async clearCache(): Promise<void> {
-    try {
-      const keys = Object.values(STORAGE_KEYS);
-      await AsyncStorage.multiRemove(keys);
-    } catch (error) {
-      console.error("Error clearing cache:", error);
-    }
-  }
-
-  async clearExpiredCache(): Promise<void> {
-    try {
-      const keys = Object.values(STORAGE_KEYS);
-      for (const key of keys) {
-        const cached = await AsyncStorage.getItem(key);
-        if (cached) {
-          const cacheEntry = JSON.parse(cached);
-          if (cacheEntry.expires && Date.now() > cacheEntry.expires) {
-            await AsyncStorage.removeItem(key);
-          }
-        }
-      }
-    } catch (error) {
-      console.error("Error clearing expired cache:", error);
-    }
-  }
-
-  // Settings Management
-  async saveUserSettings(settings: Record<string, any>): Promise<void> {
-    try {
-      await this.cacheData(STORAGE_KEYS.USER_SETTINGS, settings);
-    } catch (error) {
-      console.error("Error saving user settings:", error);
-    }
-  }
-
-  async getUserSettings(): Promise<Record<string, any>> {
-    try {
-      const settings = await this.getCachedData<Record<string, any>>(
-        STORAGE_KEYS.USER_SETTINGS
-      );
-      return settings || {};
-    } catch (error) {
-      console.error("Error getting user settings:", error);
-      return {};
-    }
-  }
-
-  // Mock Data Methods
+  // Mock data methods
   private getMockMachines(): Machine[] {
     return [
       {
@@ -1090,220 +1436,7 @@ class DieselServiceClass {
         createdAt: "2024-02-01T09:00:00Z",
         updatedAt: new Date().toISOString(),
       },
-      {
-        id: "machine_3",
-        name: "TRUCK-01",
-        plate: "KA20EF9012",
-        lastReading: 45000.8,
-        machineType: "KM/l",
-        ownershipType: "Own",
-        standardAvgDiesel: 4.2,
-        expectedDailyHours: 10.0,
-        doorNo: "C-03",
-        remarks: "Material transport truck",
-        dateAdded: "2024-01-20",
-        initialReading: 40000.0,
-        createdAt: "2024-01-20T07:30:00Z",
-        updatedAt: new Date().toISOString(),
-      },
     ];
-  }
-
-  private getMockLogs(): DieselEntry[] {
-    const now = new Date();
-    const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-
-    return [
-      {
-        id: "entry_1",
-        timestamp: now.toISOString(),
-        machineName: "JCB-12",
-        startReading: 1245.0,
-        endReading: 1250.5,
-        usage: 5.5,
-        dieselFilled: 25.0,
-        rate: 4.55,
-        remarks: "CH 1+500 to 1+800",
-        phoneNumber: "9876543210",
-        imageURL: "",
-        machineType: "L/hr",
-        consumptionMismatch: 0.55,
-        hoursMismatch: -2.5,
-        standardAvg: 4.0,
-        expectedDaily: 8.0,
-        createdAt: now.toISOString(),
-        updatedAt: now.toISOString(),
-      },
-      {
-        id: "entry_2",
-        timestamp: yesterday.toISOString(),
-        machineName: "CAT-09",
-        startReading: 885.0,
-        endReading: 890.2,
-        usage: 5.2,
-        dieselFilled: 18.0,
-        rate: 3.46,
-        remarks: "Site clearing work",
-        phoneNumber: "9876543210",
-        imageURL: "",
-        machineType: "L/hr",
-        consumptionMismatch: -0.04,
-        hoursMismatch: -0.8,
-        standardAvg: 3.5,
-        expectedDaily: 6.0,
-        createdAt: yesterday.toISOString(),
-        updatedAt: yesterday.toISOString(),
-      },
-    ];
-  }
-
-  private getMockInventoryTransactions(): InventoryEntry[] {
-    const now = new Date();
-    const lastWeek = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-
-    return [
-      {
-        id: "inventory_1",
-        type: "IN",
-        litersReceived: 500,
-        receiptNumber: "RCP001",
-        remarks: "Weekly fuel delivery",
-        phoneNumber: "9876543210",
-        timestamp: now.toISOString(),
-        createdAt: now.toISOString(),
-        updatedAt: now.toISOString(),
-      },
-      {
-        id: "inventory_2",
-        type: "IN",
-        litersReceived: 300,
-        receiptNumber: "RCP002",
-        remarks: "Emergency refill",
-        phoneNumber: "9876543210",
-        timestamp: lastWeek.toISOString(),
-        createdAt: lastWeek.toISOString(),
-        updatedAt: lastWeek.toISOString(),
-      },
-    ];
-  }
-
-  private getMockAlerts(): AlertData {
-    return {
-      overConsumption: [
-        {
-          machine: "JCB-12",
-          standardAvg: 4.0,
-          actualAvg: 5.2,
-          mismatch: 1.2,
-          timestamp: new Date().toISOString(),
-          severity: "medium",
-        },
-      ],
-      idleMachines: [
-        {
-          machine: "CAT-09",
-          expectedHours: 8,
-          actualHours: 5,
-          mismatch: -3,
-          timestamp: new Date().toISOString(),
-          severity: "high",
-        },
-      ],
-    };
-  }
-
-  private getMockMismatchData(): MismatchData[] {
-    return [
-      {
-        machine: "JCB-12",
-        standardAvg: 4.0,
-        actualAvg: 4.55,
-        consumptionMismatch: 0.55,
-        status: "Above Average",
-        expectedHours: 8.0,
-        actualHours: 5.5,
-        hoursMismatch: -2.5,
-        machineType: "L/hr",
-      },
-      {
-        machine: "CAT-09",
-        standardAvg: 3.5,
-        actualAvg: 3.46,
-        consumptionMismatch: -0.04,
-        status: "Normal",
-        expectedHours: 6.0,
-        actualHours: 5.2,
-        hoursMismatch: -0.8,
-        machineType: "L/hr",
-      },
-    ];
-  }
-
-  // Background sync (for future implementation)
-  async syncWithBackend(): Promise<boolean> {
-    try {
-      if (!this.connectionStatus.isConnected) {
-        return false;
-      }
-
-      // This would implement background synchronization
-      // of cached data when connection is restored
-
-      await this.cacheData(STORAGE_KEYS.LAST_SYNC, new Date().toISOString());
-      return true;
-    } catch (error) {
-      console.error("Background sync failed:", error);
-      return false;
-    }
-  }
-
-  // Health check
-  async getServiceHealth(): Promise<{
-    status: "healthy" | "degraded" | "down";
-    checks: Record<string, boolean>;
-    lastSync?: string;
-  }> {
-    try {
-      const checks = {
-        connection: this.connectionStatus.isConnected,
-        cache: true, // Always available
-        storage: true, // Always available
-      };
-
-      // Test storage
-      try {
-        await AsyncStorage.setItem("@health_check", "test");
-        await AsyncStorage.removeItem("@health_check");
-      } catch {
-        checks.storage = false;
-      }
-
-      const lastSync = await this.getCachedData<string>(STORAGE_KEYS.LAST_SYNC);
-      const healthyChecks = Object.values(checks).filter(Boolean).length;
-
-      let status: "healthy" | "degraded" | "down" = "healthy";
-      if (healthyChecks === 0) {
-        status = "down";
-      } else if (healthyChecks < Object.keys(checks).length) {
-        status = "degraded";
-      }
-
-      return {
-        status,
-        checks,
-        lastSync: lastSync || undefined,
-      };
-    } catch (error) {
-      console.error("Health check failed:", error);
-      return {
-        status: "down",
-        checks: {
-          connection: false,
-          cache: false,
-          storage: false,
-        },
-      };
-    }
   }
 }
 

@@ -25,8 +25,33 @@ interface SummaryStats {
   totalMachines: number;
   totalDiesel: number;
   totalUsage: number;
-  avgRate: string;
+  avgEfficiency: {
+    lhr: {
+      average: number;
+      count: number;
+      display: string;
+    };
+    kml: {
+      average: number;
+      count: number;
+      display: string;
+    };
+    combined: string;
+  };
   totalEntries: number;
+  machineBreakdown: {
+    lhrMachines: number;
+    kmlMachines: number;
+  };
+}
+
+interface MachineTypeStats {
+  type: string;
+  count: number;
+  totalDiesel: number;
+  totalUsage: number;
+  avgEfficiency: number;
+  entries: number;
 }
 
 export default function ReportsScreen() {
@@ -39,13 +64,22 @@ export default function ReportsScreen() {
     totalMachines: 0,
     totalDiesel: 0,
     totalUsage: 0,
-    avgRate: "0",
+    avgEfficiency: {
+      lhr: { average: 0, count: 0, display: "--" },
+      kml: { average: 0, count: 0, display: "--" },
+      combined: "--",
+    },
     totalEntries: 0,
+    machineBreakdown: {
+      lhrMachines: 0,
+      kmlMachines: 0,
+    },
   });
 
   // Filter state
   const [filterOwnership, setFilterOwnership] = useState<string>("");
   const [filterMachine, setFilterMachine] = useState<string>("");
+  const [filterMachineType, setFilterMachineType] = useState<string>("");
   const [filterDateFrom, setFilterDateFrom] = useState<string>("");
   const [filterDateTo, setFilterDateTo] = useState<string>("");
   const [availableMachines, setAvailableMachines] = useState<Machine[]>([]);
@@ -56,7 +90,7 @@ export default function ReportsScreen() {
 
   useEffect(() => {
     updateMachineFilter();
-  }, [filterOwnership, machines]);
+  }, [filterOwnership, filterMachineType, machines]);
 
   useEffect(() => {
     calculateSummaryStats();
@@ -89,6 +123,12 @@ export default function ReportsScreen() {
           ownershipType: "Own",
           machineType: "L/hr",
         },
+        {
+          name: "TRUCK-01",
+          plate: "KA20EF9012",
+          ownershipType: "Own",
+          machineType: "KM/l",
+        },
       ];
 
       const mockLogs = [
@@ -104,6 +144,18 @@ export default function ReportsScreen() {
           phoneNumber: "9876543210",
           machineType: "L/hr",
         },
+        {
+          timestamp: new Date().toLocaleString(),
+          machineName: "TRUCK-01",
+          startReading: 45000,
+          endReading: 45150,
+          usage: 150,
+          dieselFilled: 30.0,
+          rate: 5.0,
+          remarks: "Material transport",
+          phoneNumber: "9876543210",
+          machineType: "KM/l",
+        },
       ];
 
       setMachines(mockMachines);
@@ -115,9 +167,19 @@ export default function ReportsScreen() {
   };
 
   const updateMachineFilter = () => {
-    const filtered = filterOwnership
-      ? machines.filter((m) => m.ownershipType === filterOwnership)
-      : machines;
+    let filtered = machines;
+
+    // Filter by ownership
+    if (filterOwnership) {
+      filtered = filtered.filter((m) => m.ownershipType === filterOwnership);
+    }
+
+    // Filter by machine type
+    if (filterMachineType) {
+      filtered = filtered.filter(
+        (m) => (m.machineType || "L/hr") === filterMachineType
+      );
+    }
 
     setAvailableMachines(filtered);
 
@@ -128,6 +190,7 @@ export default function ReportsScreen() {
   };
 
   const calculateSummaryStats = () => {
+    // Calculate basic totals
     const totalDiesel = filteredLogs.reduce(
       (sum, log) => sum + (log.dieselFilled || 0),
       0
@@ -139,7 +202,7 @@ export default function ReportsScreen() {
     const uniqueMachines = new Set(filteredLogs.map((log) => log.machineName))
       .size;
 
-    // Calculate separate averages for different machine types
+    // Separate efficiency calculations by machine type
     let totalLHR = 0,
       countLHR = 0;
     let totalKML = 0,
@@ -152,34 +215,109 @@ export default function ReportsScreen() {
       if (type === "L/hr") {
         totalLHR += rate;
         countLHR++;
-      } else if (type === "L/km" || type === "KM/l") {
+      } else if (type === "KM/l" || type === "L/km") {
         totalKML += rate;
         countKML++;
       }
     });
 
-    // Create efficiency label based on what types are present
-    let efficiencyLabel;
-    const avgLHR = countLHR > 0 ? (totalLHR / countLHR).toFixed(2) : null;
-    const avgKML = countKML > 0 ? (totalKML / countKML).toFixed(2) : null;
+    // Calculate averages
+    const avgLHR = countLHR > 0 ? totalLHR / countLHR : 0;
+    const avgKML = countKML > 0 ? totalKML / countKML : 0;
 
-    if (avgLHR && avgKML) {
-      efficiencyLabel = `L/hr: ${avgLHR} | KM/l: ${avgKML}`;
-    } else if (avgLHR) {
-      efficiencyLabel = `${avgLHR} L/hr`;
-    } else if (avgKML) {
-      efficiencyLabel = `${avgKML} KM/l`;
+    // Create display strings
+    const lhrDisplay = countLHR > 0 ? `${avgLHR.toFixed(2)} L/hr` : "--";
+    const kmlDisplay = countKML > 0 ? `${avgKML.toFixed(2)} KM/l` : "--";
+
+    // Create combined efficiency label based on what types are present
+    let combinedEfficiency: string;
+    if (countLHR > 0 && countKML > 0) {
+      combinedEfficiency = `L/hr: ${avgLHR.toFixed(2)} | KM/l: ${avgKML.toFixed(
+        2
+      )}`;
+    } else if (countLHR > 0) {
+      combinedEfficiency = `${avgLHR.toFixed(2)} L/hr`;
+    } else if (countKML > 0) {
+      combinedEfficiency = `${avgKML.toFixed(2)} KM/l`;
     } else {
-      efficiencyLabel = "--";
+      combinedEfficiency = "--";
     }
+
+    // Count machine types from the filtered machines
+    const machinesInLogs = new Set(filteredLogs.map((log) => log.machineName));
+    const relevantMachines = machines.filter((m) => machinesInLogs.has(m.name));
+
+    const lhrMachines = relevantMachines.filter(
+      (m) => (m.machineType || "L/hr") === "L/hr"
+    ).length;
+    const kmlMachines = relevantMachines.filter(
+      (m) => (m.machineType || "L/hr") === "KM/l"
+    ).length;
 
     setSummaryStats({
       totalMachines: uniqueMachines,
-      totalDiesel: totalDiesel,
-      totalUsage: totalUsage,
-      avgRate: efficiencyLabel,
+      totalDiesel,
+      totalUsage,
+      avgEfficiency: {
+        lhr: {
+          average: avgLHR,
+          count: countLHR,
+          display: lhrDisplay,
+        },
+        kml: {
+          average: avgKML,
+          count: countKML,
+          display: kmlDisplay,
+        },
+        combined: combinedEfficiency,
+      },
       totalEntries: filteredLogs.length,
+      machineBreakdown: {
+        lhrMachines,
+        kmlMachines,
+      },
     });
+  };
+
+  const getMachineTypeStats = (): MachineTypeStats[] => {
+    const stats: { [key: string]: MachineTypeStats } = {};
+
+    filteredLogs.forEach((log) => {
+      const type = log.machineType || "L/hr";
+
+      if (!stats[type]) {
+        stats[type] = {
+          type,
+          count: 0,
+          totalDiesel: 0,
+          totalUsage: 0,
+          avgEfficiency: 0,
+          entries: 0,
+        };
+      }
+
+      stats[type].totalDiesel += log.dieselFilled || 0;
+      stats[type].totalUsage += log.usage || 0;
+      stats[type].avgEfficiency += parseFloat(log.rate?.toString() || "0");
+      stats[type].entries += 1;
+    });
+
+    // Calculate averages and unique machine counts
+    Object.keys(stats).forEach((type) => {
+      const typeStats = stats[type];
+      typeStats.avgEfficiency =
+        typeStats.entries > 0 ? typeStats.avgEfficiency / typeStats.entries : 0;
+
+      // Count unique machines of this type
+      const uniqueMachines = new Set(
+        filteredLogs
+          .filter((log) => (log.machineType || "L/hr") === type)
+          .map((log) => log.machineName)
+      );
+      typeStats.count = uniqueMachines.size;
+    });
+
+    return Object.values(stats);
   };
 
   const applyFilters = async () => {
@@ -196,7 +334,16 @@ export default function ReportsScreen() {
       const result = await DieselService.getLogs(filters);
 
       if (result.success) {
-        setFilteredLogs(result.logs);
+        let filtered = result.logs;
+
+        // Apply machine type filter locally if needed
+        if (filterMachineType) {
+          filtered = filtered.filter(
+            (log) => (log.machineType || "L/hr") === filterMachineType
+          );
+        }
+
+        setFilteredLogs(filtered);
       } else {
         Alert.alert("Error", "Failed to apply filters");
       }
@@ -211,6 +358,7 @@ export default function ReportsScreen() {
   const clearFilters = () => {
     setFilterOwnership("");
     setFilterMachine("");
+    setFilterMachineType("");
     setFilterDateFrom("");
     setFilterDateTo("");
     setFilteredLogs(logs);
@@ -276,12 +424,29 @@ export default function ReportsScreen() {
         }),
       ].join("\n");
 
+      // Add summary statistics to CSV
+      const summaryData = [
+        "",
+        "SUMMARY STATISTICS",
+        `Total Machines,${summaryStats.totalMachines}`,
+        `Total Diesel,${summaryStats.totalDiesel.toFixed(1)}L`,
+        `Total Usage,${summaryStats.totalUsage.toFixed(1)}`,
+        `L/hr Machines,${summaryStats.machineBreakdown.lhrMachines}`,
+        `KM/l Machines,${summaryStats.machineBreakdown.kmlMachines}`,
+        `L/hr Efficiency,${summaryStats.avgEfficiency.lhr.display}`,
+        `KM/l Efficiency,${summaryStats.avgEfficiency.kml.display}`,
+        `Combined Efficiency,"${summaryStats.avgEfficiency.combined}"`,
+        `Total Entries,${summaryStats.totalEntries}`,
+      ].join("\n");
+
+      const finalCsvData = csvData + "\n" + summaryData;
+
       const fileName = `diesel_report_${
         new Date().toISOString().split("T")[0]
       }.csv`;
       const fileUri = FileSystem.documentDirectory + fileName;
 
-      await FileSystem.writeAsStringAsync(fileUri, csvData, {
+      await FileSystem.writeAsStringAsync(fileUri, finalCsvData, {
         encoding: FileSystem.EncodingType.UTF8,
       });
 
@@ -390,6 +555,51 @@ export default function ReportsScreen() {
     );
   };
 
+  const renderMachineTypeCard = (typeStats: MachineTypeStats) => (
+    <View key={typeStats.type} style={styles.typeStatsCard}>
+      <View style={styles.typeStatsHeader}>
+        <Text style={styles.typeStatsTitle}>{typeStats.type} Machines</Text>
+        <View
+          style={[
+            styles.typeStatsBadge,
+            {
+              backgroundColor:
+                typeStats.type === "KM/l" ? "#fd79a8" : "#74b9ff",
+            },
+          ]}
+        >
+          <Text style={styles.typeStatsBadgeText}>{typeStats.count}</Text>
+        </View>
+      </View>
+
+      <View style={styles.typeStatsContent}>
+        <View style={styles.typeStatRow}>
+          <Text style={styles.typeStatLabel}>Total Diesel:</Text>
+          <Text style={styles.typeStatValue}>
+            {typeStats.totalDiesel.toFixed(1)}L
+          </Text>
+        </View>
+        <View style={styles.typeStatRow}>
+          <Text style={styles.typeStatLabel}>Total Usage:</Text>
+          <Text style={styles.typeStatValue}>
+            {typeStats.totalUsage.toFixed(1)}{" "}
+            {typeStats.type === "KM/l" ? "km" : "hrs"}
+          </Text>
+        </View>
+        <View style={styles.typeStatRow}>
+          <Text style={styles.typeStatLabel}>Avg Efficiency:</Text>
+          <Text style={[styles.typeStatValue, styles.efficiencyValue]}>
+            {typeStats.avgEfficiency.toFixed(2)} {typeStats.type}
+          </Text>
+        </View>
+        <View style={styles.typeStatRow}>
+          <Text style={styles.typeStatLabel}>Entries:</Text>
+          <Text style={styles.typeStatValue}>{typeStats.entries}</Text>
+        </View>
+      </View>
+    </View>
+  );
+
   return (
     <ThemedView style={styles.container}>
       <StatusBar style={colorScheme === "dark" ? "light" : "dark"} />
@@ -443,9 +653,43 @@ export default function ReportsScreen() {
             </View>
           </View>
 
+          {/* Enhanced Efficiency Card */}
           <View style={styles.efficiencyCard}>
             <Text style={styles.efficiencyLabel}>Average Efficiency</Text>
-            <Text style={styles.efficiencyValue}>{summaryStats.avgRate}</Text>
+            <Text style={styles.efficiencyValue}>
+              {summaryStats.avgEfficiency.combined}
+            </Text>
+
+            {/* Breakdown when both types exist */}
+            {summaryStats.avgEfficiency.lhr.count > 0 &&
+              summaryStats.avgEfficiency.kml.count > 0 && (
+                <View style={styles.efficiencyBreakdown}>
+                  <View style={styles.efficiencyBreakdownItem}>
+                    <Text style={styles.efficiencyBreakdownLabel}>
+                      L/hr machines:
+                    </Text>
+                    <Text style={styles.efficiencyBreakdownValue}>
+                      {summaryStats.avgEfficiency.lhr.display}
+                    </Text>
+                  </View>
+                  <View style={styles.efficiencyBreakdownItem}>
+                    <Text style={styles.efficiencyBreakdownLabel}>
+                      KM/l machines:
+                    </Text>
+                    <Text style={styles.efficiencyBreakdownValue}>
+                      {summaryStats.avgEfficiency.kml.display}
+                    </Text>
+                  </View>
+                </View>
+              )}
+          </View>
+
+          {/* Machine Type Breakdown */}
+          <View style={styles.machineTypeSection}>
+            <Text style={styles.sectionSubtitle}>Machine Type Breakdown</Text>
+            <View style={styles.machineTypeCards}>
+              {getMachineTypeStats().map(renderMachineTypeCard)}
+            </View>
           </View>
         </View>
 
@@ -453,25 +697,42 @@ export default function ReportsScreen() {
         <View style={styles.filtersSection}>
           <ThemedText style={styles.sectionTitle}>🔍 Filters</ThemedText>
 
-          {/* Ownership Filter */}
-          <View style={styles.formGroup}>
-            <Text style={styles.label}>Ownership Type</Text>
-            <View style={styles.pickerContainer}>
-              <Picker
-                selectedValue={filterOwnership}
-                onValueChange={setFilterOwnership}
-                style={styles.picker}
-              >
-                <Picker.Item label="-- All Ownership Types --" value="" />
-                <Picker.Item label="Own" value="Own" />
-                <Picker.Item label="Rental" value="Rental" />
-              </Picker>
+          {/* Ownership and Machine Type Filter */}
+          <View style={styles.filterRow}>
+            <View style={[styles.formGroup, { flex: 1, marginRight: 10 }]}>
+              <Text style={styles.label}>Ownership Type</Text>
+              <View style={styles.pickerContainer}>
+                <Picker
+                  selectedValue={filterOwnership}
+                  onValueChange={setFilterOwnership}
+                  style={styles.picker}
+                >
+                  <Picker.Item label="-- All Ownership --" value="" />
+                  <Picker.Item label="Own" value="Own" />
+                  <Picker.Item label="Rental" value="Rental" />
+                </Picker>
+              </View>
+            </View>
+
+            <View style={[styles.formGroup, { flex: 1, marginLeft: 10 }]}>
+              <Text style={styles.label}>Machine Type</Text>
+              <View style={styles.pickerContainer}>
+                <Picker
+                  selectedValue={filterMachineType}
+                  onValueChange={setFilterMachineType}
+                  style={styles.picker}
+                >
+                  <Picker.Item label="-- All Types --" value="" />
+                  <Picker.Item label="L/hr (Engine Hours)" value="L/hr" />
+                  <Picker.Item label="KM/l (Kilometers)" value="KM/l" />
+                </Picker>
+              </View>
             </View>
           </View>
 
           {/* Machine Filter */}
           <View style={styles.formGroup}>
-            <Text style={styles.label}>Machine</Text>
+            <Text style={styles.label}>Specific Machine</Text>
             <View style={styles.pickerContainer}>
               <Picker
                 selectedValue={filterMachine}
@@ -484,7 +745,7 @@ export default function ReportsScreen() {
                     key={index}
                     label={`${generateMachineId(machine.name)} (${
                       machine.ownershipType || "Own"
-                    })`}
+                    }) - ${machine.machineType || "L/hr"}`}
                     value={machine.name}
                   />
                 ))}
@@ -605,6 +866,12 @@ const styles = StyleSheet.create({
     fontWeight: "bold",
     marginBottom: 15,
   },
+  sectionSubtitle: {
+    fontSize: 16,
+    fontWeight: "600",
+    marginBottom: 15,
+    color: "#333",
+  },
   summaryCards: {
     flexDirection: "row",
     justifyContent: "space-between",
@@ -633,6 +900,7 @@ const styles = StyleSheet.create({
     padding: 20,
     borderRadius: 12,
     alignItems: "center",
+    marginBottom: 20,
   },
   efficiencyLabel: {
     fontSize: 14,
@@ -643,9 +911,91 @@ const styles = StyleSheet.create({
     fontWeight: "bold",
     color: "white",
     marginTop: 5,
+    textAlign: "center",
+  },
+  efficiencyBreakdown: {
+    marginTop: 15,
+    width: "100%",
+    gap: 8,
+  },
+  efficiencyBreakdownItem: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+  efficiencyBreakdownLabel: {
+    fontSize: 13,
+    color: "rgba(255, 255, 255, 0.8)",
+  },
+  efficiencyBreakdownValue: {
+    fontSize: 13,
+    fontWeight: "600",
+    color: "white",
+  },
+  machineTypeSection: {
+    marginBottom: 20,
+  },
+  machineTypeCards: {
+    gap: 15,
+  },
+  typeStatsCard: {
+    backgroundColor: "white",
+    borderRadius: 12,
+    padding: 15,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  typeStatsHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 15,
+    paddingBottom: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: "#f0f0f0",
+  },
+  typeStatsTitle: {
+    fontSize: 16,
+    fontWeight: "bold",
+    color: "#333",
+  },
+  typeStatsBadge: {
+    backgroundColor: "#74b9ff",
+    borderRadius: 15,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+  },
+  typeStatsBadgeText: {
+    color: "white",
+    fontSize: 14,
+    fontWeight: "bold",
+  },
+  typeStatsContent: {
+    gap: 8,
+  },
+  typeStatRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+  typeStatLabel: {
+    fontSize: 14,
+    color: "#666",
+  },
+  typeStatValue: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: "#333",
   },
   filtersSection: {
     marginTop: 30,
+  },
+  filterRow: {
+    flexDirection: "row",
+    marginBottom: 15,
   },
   formGroup: {
     marginBottom: 15,
