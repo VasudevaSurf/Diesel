@@ -1,5 +1,3 @@
-// Fallback for using MaterialIcons on Android and web.
-
 import MaterialIcons from "@expo/vector-icons/MaterialIcons";
 import { SymbolWeight, SymbolViewProps } from "expo-symbols";
 import { ComponentProps } from "react";
@@ -41,6 +39,25 @@ const MAPPING = {
   "wrench.and.screwdriver": "build",
   qrcode: "qr-code",
   trash: "delete",
+
+  // Alert-specific icons
+  warning: "warning",
+  "exclamation.triangle": "warning",
+  "checkmark.circle": "check-circle",
+  "pause-circle": "pause-circle-outline",
+  "trending-down": "trending-down",
+  "trending-up": "trending-up",
+  timer: "timer",
+  hourglass: "hourglass-empty",
+
+  // Additional utility icons
+  refresh: "refresh",
+  filter: "filter-list",
+  "arrow.up.circle": "keyboard-arrow-up",
+  "arrow.down.circle": "keyboard-arrow-down",
+  "info.circle": "info",
+  "bell.fill": "notifications",
+  bell: "notifications-none",
 } as IconMapping;
 
 /**

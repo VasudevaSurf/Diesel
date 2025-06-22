@@ -36,6 +36,7 @@ export default function DieselEntryScreen() {
   const [phoneNumber, setPhoneNumber] = useState<string>("");
   const [lastReading, setLastReading] = useState<string>("");
   const [currentReading, setCurrentReading] = useState<string>("");
+  const [confirmReading, setConfirmReading] = useState<string>(""); // New confirmation field
   const [dieselFilled, setDieselFilled] = useState<string>("");
   const [remarks, setRemarks] = useState<string>("");
   const [usage, setUsage] = useState<string>("");
@@ -49,11 +50,14 @@ export default function DieselEntryScreen() {
   const [showQRScanner, setShowQRScanner] = useState(false);
   const [hasPermission, setHasPermission] = useState<boolean | null>(null);
   const [scanned, setScanned] = useState(false);
-  const [isQRMode, setIsQRMode] = useState(false);
+  const [isQRMode, setIsQRMode] = useState(true); // QR mode is default
 
   // Validation state
   const [currentReadingError, setCurrentReadingError] = useState<string>("");
+  const [confirmReadingError, setConfirmReadingError] = useState<string>("");
   const [isValidCurrentReading, setIsValidCurrentReading] = useState(true);
+  const [isValidConfirmReading, setIsValidConfirmReading] = useState(true);
+  const [readingsMatch, setReadingsMatch] = useState(true);
 
   useEffect(() => {
     loadData();
@@ -155,14 +159,18 @@ export default function DieselEntryScreen() {
         setLastReading(machine.lastReading?.toString() || "0");
         setIsQRMode(true);
 
-        // Clear any previous calculations
+        // Clear any previous calculations and validations
         setCurrentReading("");
+        setConfirmReading("");
         setDieselFilled("");
         setUsage("");
         setRate("");
         setAlertMessage("");
         setCurrentReadingError("");
+        setConfirmReadingError("");
         setIsValidCurrentReading(true);
+        setIsValidConfirmReading(true);
+        setReadingsMatch(true);
 
         Alert.alert(
           "QR Code Scanned ✅",
@@ -170,7 +178,7 @@ export default function DieselEntryScreen() {
             machine.machineType || "L/hr"
           }\nOwnership: ${
             machine.ownershipType || "Own"
-          }\n\nPlease enter the current reading and diesel amount.`
+          }\n\nPlease enter the current reading twice for verification and diesel amount.`
         );
       } else {
         Alert.alert(
@@ -178,7 +186,7 @@ export default function DieselEntryScreen() {
           `The scanned QR code "${machineId}" doesn't match any registered machine.\n\nPlease check if the machine is registered in the admin panel.`,
           [
             { text: "Scan Again", onPress: () => setShowQRScanner(true) },
-            { text: "Manual Entry", onPress: () => setIsQRMode(false) },
+            { text: "Cancel", onPress: () => {} },
           ]
         );
       }
@@ -189,38 +197,12 @@ export default function DieselEntryScreen() {
         "The QR code format is not recognized. Please scan a valid machine QR code.",
         [
           { text: "Scan Again", onPress: () => setShowQRScanner(true) },
-          { text: "Manual Entry", onPress: () => setIsQRMode(false) },
+          { text: "Cancel", onPress: () => {} },
         ]
       );
     }
 
     setScanned(false);
-  };
-
-  const handleMachineChange = (machineName: string) => {
-    setSelectedMachine(machineName);
-    const machine = machines.find((m) => m.name === machineName);
-    setSelectedMachineData(machine || null);
-
-    if (machine) {
-      setLastReading(machine.lastReading?.toString() || "0");
-      // Reset validation when changing machine
-      setCurrentReadingError("");
-      setIsValidCurrentReading(true);
-      calculateUsageAndRate(
-        machine.lastReading || 0,
-        parseFloat(currentReading) || 0,
-        parseFloat(dieselFilled) || 0,
-        machine
-      );
-    } else {
-      setLastReading("");
-      setUsage("");
-      setRate("");
-      setAlertMessage("");
-      setCurrentReadingError("");
-      setIsValidCurrentReading(true);
-    }
   };
 
   const validateCurrentReading = (value: string, lastRead: number): boolean => {
@@ -244,6 +226,41 @@ export default function DieselEntryScreen() {
 
     setCurrentReadingError("");
     setIsValidCurrentReading(true);
+    return true;
+  };
+
+  const validateReadingsMatch = (
+    currentValue: string,
+    confirmValue: string
+  ): boolean => {
+    // Allow empty values during typing
+    if (!currentValue || !confirmValue) {
+      setConfirmReadingError("");
+      setReadingsMatch(true);
+      return true;
+    }
+
+    const current = parseFloat(currentValue);
+    const confirm = parseFloat(confirmValue);
+
+    // Check if both are valid numbers
+    if (isNaN(current) || isNaN(confirm)) {
+      setConfirmReadingError("");
+      setReadingsMatch(true);
+      return true;
+    }
+
+    // Check if readings match
+    if (current !== confirm) {
+      setConfirmReadingError(
+        "❌ Readings do not match! Please check both values."
+      );
+      setReadingsMatch(false);
+      return false;
+    }
+
+    setConfirmReadingError("✅ Readings match perfectly!");
+    setReadingsMatch(true);
     return true;
   };
 
@@ -283,9 +300,36 @@ export default function DieselEntryScreen() {
     const lastRead = parseFloat(lastReading) || 0;
     const diesel = parseFloat(dieselFilled) || 0;
 
+    // Validate readings match if confirmation reading exists
+    if (confirmReading) {
+      validateReadingsMatch(value, confirmReading);
+    }
+
     // Always allow typing, only validate when field loses focus or when moving to next field
     if (value && !isNaN(currentRead)) {
       calculateUsageAndRate(lastRead, currentRead, diesel);
+    }
+  };
+
+  const handleConfirmReadingChange = (value: string) => {
+    setConfirmReading(value);
+
+    // Validate readings match
+    validateReadingsMatch(currentReading, value);
+
+    // If readings match, use the confirmed value for calculations
+    if (
+      currentReading &&
+      value &&
+      parseFloat(currentReading) === parseFloat(value)
+    ) {
+      const currentRead = parseFloat(value);
+      const lastRead = parseFloat(lastReading) || 0;
+      const diesel = parseFloat(dieselFilled) || 0;
+
+      if (!isNaN(currentRead)) {
+        calculateUsageAndRate(lastRead, currentRead, diesel);
+      }
     }
   };
 
@@ -296,6 +340,11 @@ export default function DieselEntryScreen() {
     if (currentReading && !isNaN(currentRead)) {
       validateCurrentReading(currentReading, lastRead);
     }
+  };
+
+  const handleConfirmReadingBlur = () => {
+    // Validate readings match when confirm field loses focus
+    validateReadingsMatch(currentReading, confirmReading);
   };
 
   const handleDieselFilledChange = (value: string) => {
@@ -309,7 +358,12 @@ export default function DieselEntryScreen() {
       );
     }
 
-    const currentRead = parseFloat(currentReading) || 0;
+    // Use confirmed reading if available and matches, otherwise use current reading
+    const readingToUse =
+      readingsMatch && confirmReading
+        ? parseFloat(confirmReading)
+        : parseFloat(currentReading);
+    const currentRead = readingToUse || 0;
     const lastRead = parseFloat(lastReading) || 0;
     calculateUsageAndRate(lastRead, currentRead, diesel);
   };
@@ -374,7 +428,7 @@ export default function DieselEntryScreen() {
 
   const validateForm = (): boolean => {
     if (!selectedMachine) {
-      Alert.alert("Error", "Please select a machine");
+      Alert.alert("Error", "Please scan a machine QR code first");
       return false;
     }
 
@@ -384,10 +438,24 @@ export default function DieselEntryScreen() {
     }
 
     const currentRead = parseFloat(currentReading);
+    const confirmRead = parseFloat(confirmReading);
     const lastRead = parseFloat(lastReading) || 0;
 
     if (!currentReading || isNaN(currentRead)) {
       Alert.alert("Error", "Please enter current reading");
+      return false;
+    }
+
+    if (!confirmReading || isNaN(confirmRead)) {
+      Alert.alert("Error", "Please confirm the current reading");
+      return false;
+    }
+
+    if (currentRead !== confirmRead) {
+      Alert.alert(
+        "Error",
+        "Current reading and confirmation reading do not match. Please check both values."
+      );
       return false;
     }
 
@@ -421,7 +489,7 @@ export default function DieselEntryScreen() {
       const entryData = {
         machineName: selectedMachine,
         startReading: parseFloat(lastReading) || 0,
-        endReading: parseFloat(currentReading) || 0,
+        endReading: parseFloat(confirmReading) || 0, // Use confirmed reading
         dieselFilled: parseFloat(dieselFilled) || 0,
         remarks: remarks,
         phoneNumber: phoneNumber.replace(/\D/g, ""),
@@ -461,6 +529,7 @@ export default function DieselEntryScreen() {
     setPhoneNumber("");
     setLastReading("");
     setCurrentReading("");
+    setConfirmReading("");
     setDieselFilled("");
     setRemarks("");
     setUsage("");
@@ -468,31 +537,12 @@ export default function DieselEntryScreen() {
     setSelectedMachineData(null);
     setImageUri("");
     setAlertMessage("");
-    setIsQRMode(false);
+    // Keep QR mode as default - don't reset to false
     setCurrentReadingError("");
+    setConfirmReadingError("");
     setIsValidCurrentReading(true);
-  };
-
-  const toggleEntryMode = () => {
-    if (isQRMode) {
-      // Switch to manual mode
-      setIsQRMode(false);
-      resetForm();
-    } else {
-      // Switch to QR mode
-      if (hasPermission) {
-        setShowQRScanner(true);
-      } else {
-        Alert.alert(
-          "Camera Permission Required",
-          "Please grant camera permission to scan QR codes.",
-          [
-            { text: "Cancel", style: "cancel" },
-            { text: "Settings", onPress: getBarCodeScannerPermissions },
-          ]
-        );
-      }
-    }
+    setIsValidConfirmReading(true);
+    setReadingsMatch(true);
   };
 
   const pickImage = async () => {
@@ -560,21 +610,30 @@ export default function DieselEntryScreen() {
         ]}
       >
         <ThemedText style={styles.headerTitle}>
-          📝 Daily Diesel Entry
+          📝 Daily Diesel Entry (QR Mode)
         </ThemedText>
 
-        {/* Mode Toggle Button */}
+        {/* QR Scanner Button */}
         <TouchableOpacity
-          style={styles.modeToggleButton}
-          onPress={toggleEntryMode}
+          style={styles.qrScanButton}
+          onPress={() => {
+            if (hasPermission) {
+              setShowQRScanner(true);
+            } else {
+              Alert.alert(
+                "Camera Permission Required",
+                "Please grant camera permission to scan QR codes.",
+                [
+                  { text: "Cancel", style: "cancel" },
+                  { text: "Settings", onPress: getBarCodeScannerPermissions },
+                ]
+              );
+            }
+          }}
         >
-          <IconSymbol
-            name={isQRMode ? "gear.circle.fill" : "camera.fill"}
-            size={20}
-            color="white"
-          />
-          <Text style={styles.modeToggleText}>
-            {isQRMode ? "Manual Entry" : "Scan QR Code"}
+          <IconSymbol name="camera.fill" size={20} color="white" />
+          <Text style={styles.qrScanButtonText}>
+            {selectedMachine ? "Scan New QR Code" : "Scan Machine QR Code"}
           </Text>
         </TouchableOpacity>
       </View>
@@ -645,42 +704,29 @@ export default function DieselEntryScreen() {
 
       <ScrollView style={styles.content} showsVerticalScrollIndicator={false}>
         {/* Mode Indicator */}
-        {isQRMode && (
-          <View style={styles.qrModeIndicator}>
-            <IconSymbol name="camera.fill" size={20} color="#28a745" />
-            <Text style={styles.qrModeText}>
-              QR Mode Active - Machine auto-selected
-            </Text>
-          </View>
-        )}
+        <View style={styles.qrModeIndicator}>
+          <IconSymbol name="camera.fill" size={20} color="#28a745" />
+          <Text style={styles.qrModeText}>
+            QR Mode Active - Scan machine QR code to begin
+          </Text>
+        </View>
 
-        {/* Machine Selection */}
+        {/* Machine Selection - Always Disabled */}
         <View style={styles.formGroup}>
-          <Text style={styles.label}>Select Machine *</Text>
-          <View style={styles.pickerContainer}>
-            <Picker
-              selectedValue={selectedMachine}
-              onValueChange={handleMachineChange}
-              style={styles.picker}
-              enabled={!isQRMode} // Disable in QR mode
-            >
-              <Picker.Item label="-- Select Machine --" value="" />
-              {machines.map((machine, index) => (
-                <Picker.Item
-                  key={index}
-                  label={`${generateMachineId(machine)} (${
-                    machine.ownershipType || "Own"
-                  }) - ${machine.machineType || "L/hr"}`}
-                  value={machine.name}
-                />
-              ))}
-            </Picker>
-          </View>
-          {isQRMode && (
-            <Text style={styles.disabledNote}>
-              Machine locked via QR code. Use "Manual Entry" to change.
+          <Text style={styles.label}>Machine Information</Text>
+          <View style={[styles.pickerContainer, styles.disabledPicker]}>
+            <Text style={styles.placeholderText}>
+              {selectedMachine
+                ? `${generateMachineId(selectedMachineData!)} (${
+                    selectedMachineData?.ownershipType || "Own"
+                  }) - ${selectedMachineData?.machineType || "L/hr"}`
+                : "Please scan QR code to select machine"}
             </Text>
-          )}
+          </View>
+          <Text style={styles.disabledNote}>
+            Machine selection is only available via QR code scanning for
+            security and accuracy.
+          </Text>
         </View>
 
         {/* Machine Info Card */}
@@ -744,7 +790,7 @@ export default function DieselEntryScreen() {
                 {isQRMode && (
                   <View style={[styles.badge, { backgroundColor: "#28a745" }]}>
                     <Text style={[styles.badgeText, { color: "white" }]}>
-                      QR SCANNED
+                      QR VERIFIED
                     </Text>
                   </View>
                 )}
@@ -789,9 +835,12 @@ export default function DieselEntryScreen() {
           </Text>
         </View>
 
-        {/* Readings */}
-        <View style={styles.formRow}>
-          <View style={[styles.formGroup, { flex: 1, marginRight: 10 }]}>
+        {/* Enhanced Readings Section with Verification */}
+        <View style={styles.readingsSection}>
+          <Text style={styles.sectionTitle}>📊 Engine/KM Readings</Text>
+
+          {/* Last Reading */}
+          <View style={styles.formGroup}>
             <Text style={styles.label}>
               {selectedMachineData?.machineType === "KM/l"
                 ? "Last KM Reading"
@@ -804,7 +853,8 @@ export default function DieselEntryScreen() {
             />
           </View>
 
-          <View style={[styles.formGroup, { flex: 1, marginLeft: 10 }]}>
+          {/* Current Reading - First Entry */}
+          <View style={styles.formGroup}>
             <Text style={styles.label}>
               {selectedMachineData?.machineType === "KM/l"
                 ? "Current KM Reading *"
@@ -823,6 +873,41 @@ export default function DieselEntryScreen() {
             />
             {currentReadingError ? (
               <Text style={styles.errorText}>{currentReadingError}</Text>
+            ) : null}
+          </View>
+
+          {/* Current Reading - Confirmation */}
+          <View style={styles.formGroup}>
+            <Text style={styles.label}>
+              {selectedMachineData?.machineType === "KM/l"
+                ? "Confirm KM Reading *"
+                : "Confirm Engine Reading *"}
+              <Text style={styles.labelNote}> (Double-check for accuracy)</Text>
+            </Text>
+            <TextInput
+              style={[
+                styles.input,
+                !readingsMatch && confirmReading && styles.inputError,
+                readingsMatch &&
+                  confirmReading &&
+                  currentReading &&
+                  styles.inputSuccess,
+              ]}
+              value={confirmReading}
+              onChangeText={handleConfirmReadingChange}
+              onBlur={handleConfirmReadingBlur}
+              placeholder="Re-enter the same reading to confirm"
+              keyboardType="numeric"
+            />
+            {confirmReadingError ? (
+              <Text
+                style={[
+                  styles.validationText,
+                  { color: readingsMatch ? "#28a745" : "#dc3545" },
+                ]}
+              >
+                {confirmReadingError}
+              </Text>
             ) : null}
           </View>
         </View>
@@ -925,20 +1010,22 @@ export default function DieselEntryScreen() {
             styles.submitButton,
             {
               backgroundColor:
-                currentBalance <= 0
+                currentBalance <= 0 || !readingsMatch
                   ? "#6c757d"
                   : Colors[colorScheme ?? "light"].tint,
               opacity: loading ? 0.7 : 1,
             },
           ]}
           onPress={handleSubmit}
-          disabled={loading || currentBalance <= 0}
+          disabled={loading || currentBalance <= 0 || !readingsMatch}
         >
           <Text style={styles.submitButtonText}>
             {loading
               ? "Submitting..."
               : currentBalance <= 0
               ? "No Diesel Available"
+              : !readingsMatch
+              ? "Verify Readings First"
               : "Submit Entry"}
           </Text>
         </TouchableOpacity>
@@ -964,7 +1051,7 @@ const styles = StyleSheet.create({
     textAlign: "center",
     marginBottom: 10,
   },
-  modeToggleButton: {
+  qrScanButton: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
@@ -975,7 +1062,7 @@ const styles = StyleSheet.create({
     alignSelf: "center",
     gap: 8,
   },
-  modeToggleText: {
+  qrScanButtonText: {
     color: "white",
     fontSize: 14,
     fontWeight: "600",
@@ -1008,10 +1095,34 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: "600",
   },
+  disabledPicker: {
+    backgroundColor: "#f8f9fa",
+    borderColor: "#e9ecef",
+  },
+  placeholderText: {
+    padding: 15,
+    fontSize: 16,
+    color: "#6c757d",
+    fontStyle: "italic",
+  },
   content: {
     flex: 1,
     paddingHorizontal: 20,
     paddingTop: 20,
+  },
+  readingsSection: {
+    backgroundColor: "#f8f9fa",
+    borderRadius: 12,
+    padding: 15,
+    marginBottom: 20,
+    borderLeftWidth: 4,
+    borderLeftColor: "#007bff",
+  },
+  sectionTitle: {
+    fontSize: 16,
+    fontWeight: "bold",
+    color: "#333",
+    marginBottom: 15,
   },
   formGroup: {
     marginBottom: 20,
@@ -1026,6 +1137,12 @@ const styles = StyleSheet.create({
     marginBottom: 8,
     color: "#333",
   },
+  labelNote: {
+    fontSize: 12,
+    fontWeight: "400",
+    color: "#666",
+    fontStyle: "italic",
+  },
   input: {
     borderWidth: 2,
     borderColor: "#e1e5e9",
@@ -1037,6 +1154,10 @@ const styles = StyleSheet.create({
   inputError: {
     borderColor: "#dc3545",
     backgroundColor: "#fff5f5",
+  },
+  inputSuccess: {
+    borderColor: "#28a745",
+    backgroundColor: "#f0fff4",
   },
   errorText: {
     color: "#dc3545",

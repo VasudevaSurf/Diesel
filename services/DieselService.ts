@@ -4,7 +4,7 @@ import * as Network from "expo-network";
 // Configuration
 const CONFIG = {
   APPS_SCRIPT_URL:
-    "https://script.google.com/macros/s/AKfycbzFd_MZl7qDolMdw5GVtC7cenn4DKAWQnX0NTuq0MP727-DRvq5RFT-nUxt9A7mFyj3/exec",
+    "https://script.google.com/macros/s/AKfycbyqGusXd-536tQDqPpHNiWcCrrL70Rtg5LncRi0pkTK3oBcDQKGUk6vZnUs_g5Krz9G/exec",
   ADMIN_PASSWORD: "admin123",
   INVENTORY_PASSWORD: "inventory456",
   TIMEOUT: 15000, // Reduced to 15 seconds for better UX
@@ -138,6 +138,69 @@ export interface ConnectionStatus {
   error?: string;
   networkType?: string;
   networkState?: string;
+}
+
+export interface EnhancedAlertData {
+  recent: AlertItem[];
+  weekly: AlertItem[];
+  monthly: AlertItem[];
+  overConsumption: AlertItem[];
+  lowEfficiency: AlertItem[];
+  idleMachines: AlertItem[];
+  underWorked: AlertItem[];
+  maintenanceDue: AlertItem[];
+  unusualPatterns: AlertItem[];
+  summary: {
+    total: number;
+    high: number;
+    medium: number;
+    low: number;
+    critical: number;
+  };
+}
+
+export interface AlertItem {
+  id: string;
+  timestamp: string;
+  machine: string;
+  plate?: string;
+  alertType:
+    | "OVER_CONSUMPTION"
+    | "LOW_EFFICIENCY"
+    | "IDLE_MACHINE"
+    | "UNDER_WORKED"
+    | "MAINTENANCE_DUE"
+    | "UNUSUAL_PATTERN";
+  severity: "low" | "medium" | "high" | "critical";
+  standardValue: number;
+  actualValue: number;
+  mismatch: number;
+  unit: string;
+  description: string;
+  machineType: string;
+  ownershipType: string;
+  status: "active" | "resolved" | "acknowledged";
+  expectedHours?: number;
+  actualHours?: number;
+}
+
+export interface MachinePerformanceAnalytics {
+  machine: string;
+  plate: string;
+  machineType: string;
+  ownershipType: string;
+  totalEntries: number;
+  avgDailyUsage: number;
+  avgConsumptionRate: number;
+  totalUsage: number;
+  totalDiesel: number;
+  efficiencyTrend: "improving" | "declining" | "stable" | "no-data";
+  alertRisk: "low" | "medium" | "high";
+  recommendations: string[];
+  standardValues: {
+    expectedDaily: number;
+    standardConsumption: number;
+  };
 }
 
 class DieselServiceClass {
@@ -287,6 +350,431 @@ class DieselServiceClass {
         await this.processOfflineQueue();
       }
     }, CONFIG.SYNC_INTERVAL);
+  }
+
+  async getEnhancedAlertsData(): Promise<{
+    alerts: EnhancedAlertData;
+    success: boolean;
+  }> {
+    try {
+      if (!this.connectionStatus.isConnected) {
+        // Return mock data for offline mode
+        const mockAlerts = this.getMockEnhancedAlerts();
+        return { alerts: mockAlerts, success: true };
+      }
+
+      const response = await this.makeRequest<{ alerts: EnhancedAlertData }>(
+        `${CONFIG.APPS_SCRIPT_URL}?action=getAlertsData&timestamp=${Date.now()}`
+      );
+
+      if (response.success && response.alerts) {
+        // Cache alerts data
+        await this.cacheData(
+          "@diesel_tracker:enhanced_alerts",
+          response.alerts
+        );
+        return { alerts: response.alerts, success: true };
+      } else {
+        throw new Error(response.message || "Failed to fetch enhanced alerts");
+      }
+    } catch (error) {
+      console.error("❌ Error fetching enhanced alerts:", error);
+
+      // Try to return cached data
+      const cached = await this.getCachedData<EnhancedAlertData>(
+        "@diesel_tracker:enhanced_alerts"
+      );
+      if (cached) {
+        return { alerts: cached, success: false };
+      }
+
+      // Return mock data as fallback
+      return { alerts: this.getMockEnhancedAlerts(), success: false };
+    }
+  }
+
+  async getMachinePerformanceAnalytics(): Promise<{
+    analytics: MachinePerformanceAnalytics[];
+    summary: any;
+    success: boolean;
+  }> {
+    try {
+      if (!this.connectionStatus.isConnected) {
+        return {
+          analytics: this.getMockPerformanceAnalytics(),
+          summary: this.getMockPerformanceSummary(),
+          success: true,
+        };
+      }
+
+      const response = await this.makeRequest<{
+        analytics: MachinePerformanceAnalytics[];
+        summary: any;
+      }>(
+        `${
+          CONFIG.APPS_SCRIPT_URL
+        }?action=getMachinePerformanceAnalytics&timestamp=${Date.now()}`
+      );
+
+      if (response.success) {
+        await this.cacheData("@diesel_tracker:performance_analytics", {
+          analytics: response.analytics,
+          summary: response.summary,
+        });
+
+        return {
+          analytics: response.analytics || [],
+          summary: response.summary || {},
+          success: true,
+        };
+      } else {
+        throw new Error(
+          response.message || "Failed to fetch performance analytics"
+        );
+      }
+    } catch (error) {
+      console.error("❌ Error fetching performance analytics:", error);
+
+      // Try cached data
+      const cached = await this.getCachedData<{
+        analytics: MachinePerformanceAnalytics[];
+        summary: any;
+      }>("@diesel_tracker:performance_analytics");
+
+      if (cached) {
+        return { ...cached, success: false };
+      }
+
+      return {
+        analytics: this.getMockPerformanceAnalytics(),
+        summary: this.getMockPerformanceSummary(),
+        success: false,
+      };
+    }
+  }
+
+  async updateAlertStatus(
+    alertId: string,
+    status: "acknowledged" | "resolved",
+    resolvedBy?: string,
+    comments?: string
+  ): Promise<ApiResponse> {
+    try {
+      if (!this.connectionStatus.isConnected) {
+        // For offline mode, just update local cache
+        const cached = await this.getCachedData<EnhancedAlertData>(
+          "@diesel_tracker:enhanced_alerts"
+        );
+        if (cached) {
+          // Update status in all relevant arrays
+          const updateAlertInArray = (alerts: AlertItem[]) => {
+            const alert = alerts.find((a) => a.id === alertId);
+            if (alert) {
+              alert.status = status;
+            }
+          };
+
+          updateAlertInArray(cached.recent);
+          updateAlertInArray(cached.weekly);
+          updateAlertInArray(cached.monthly);
+          updateAlertInArray(cached.overConsumption);
+          updateAlertInArray(cached.lowEfficiency);
+          updateAlertInArray(cached.idleMachines);
+          updateAlertInArray(cached.underWorked);
+          updateAlertInArray(cached.maintenanceDue);
+          updateAlertInArray(cached.unusualPatterns);
+
+          await this.cacheData("@diesel_tracker:enhanced_alerts", cached);
+        }
+
+        // Queue for later sync
+        await this.addToOfflineQueue(
+          "alertUpdate",
+          {
+            alertId,
+            status,
+            resolvedBy,
+            comments,
+          },
+          2
+        );
+
+        return {
+          success: true,
+          message: `Alert ${status} locally. Will sync when online.`,
+        };
+      }
+
+      const response = await this.makeRequest(CONFIG.APPS_SCRIPT_URL, {
+        method: "POST",
+        body: JSON.stringify({
+          action: "updateAlertStatus",
+          alertId,
+          status,
+          resolvedBy,
+          comments,
+          timestamp: Date.now(),
+        }),
+      });
+
+      if (response.success) {
+        // Update local cache
+        const cached = await this.getCachedData<EnhancedAlertData>(
+          "@diesel_tracker:enhanced_alerts"
+        );
+        if (cached) {
+          // Update the alert status in cached data
+          const updateAlertInArray = (alerts: AlertItem[]) => {
+            const alert = alerts.find((a) => a.id === alertId);
+            if (alert) {
+              alert.status = status;
+            }
+          };
+
+          updateAlertInArray(cached.recent);
+          updateAlertInArray(cached.weekly);
+          updateAlertInArray(cached.monthly);
+          updateAlertInArray(cached.overConsumption);
+          updateAlertInArray(cached.lowEfficiency);
+          updateAlertInArray(cached.idleMachines);
+          updateAlertInArray(cached.underWorked);
+          updateAlertInArray(cached.maintenanceDue);
+          updateAlertInArray(cached.unusualPatterns);
+
+          await this.cacheData("@diesel_tracker:enhanced_alerts", cached);
+        }
+
+        return {
+          success: true,
+          message: `Alert ${status} successfully!`,
+        };
+      } else {
+        throw new Error(response.message || "Failed to update alert status");
+      }
+    } catch (error) {
+      console.error("❌ Error updating alert status:", error);
+      return {
+        success: false,
+        message: `Failed to update alert status: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`,
+      };
+    }
+  }
+
+  /**
+   * Export alerts data
+   */
+  async exportAlertsData(): Promise<{ data: any; success: boolean }> {
+    try {
+      if (!this.connectionStatus.isConnected) {
+        // Generate export from cached data
+        const alerts = await this.getCachedData<EnhancedAlertData>(
+          "@diesel_tracker:enhanced_alerts"
+        );
+        const analytics = await this.getCachedData<{
+          analytics: MachinePerformanceAnalytics[];
+          summary: any;
+        }>("@diesel_tracker:performance_analytics");
+
+        return {
+          data: {
+            timestamp: new Date().toISOString(),
+            alerts: alerts || this.getMockEnhancedAlerts(),
+            analytics:
+              analytics?.analytics || this.getMockPerformanceAnalytics(),
+            summary: {
+              alerts: alerts?.summary || {
+                total: 0,
+                high: 0,
+                medium: 0,
+                low: 0,
+                critical: 0,
+              },
+              performance: analytics?.summary || {
+                totalMachines: 0,
+                highRisk: 0,
+                mediumRisk: 0,
+                lowRisk: 0,
+              },
+            },
+            metadata: {
+              version: "3.1",
+              exportedBy: "Diesel Tracker Pro (Offline)",
+              source: "cached-data",
+            },
+          },
+          success: true,
+        };
+      }
+
+      const response = await this.makeRequest<{ data: any }>(
+        `${
+          CONFIG.APPS_SCRIPT_URL
+        }?action=exportAlertsData&timestamp=${Date.now()}`
+      );
+
+      if (response.success && response.data) {
+        return { data: response.data, success: true };
+      } else {
+        throw new Error(response.message || "Failed to export alerts data");
+      }
+    } catch (error) {
+      console.error("❌ Error exporting alerts data:", error);
+      return {
+        data: null,
+        success: false,
+      };
+    }
+  }
+
+  /**
+   * Generate mock enhanced alerts data for demo/offline mode
+   */
+  private getMockEnhancedAlerts(): EnhancedAlertData {
+    const now = new Date();
+    const mockAlerts: AlertItem[] = [
+      {
+        id: "alert_1",
+        timestamp: now.toISOString(),
+        machine: "JCB-12",
+        plate: "AP09AB1234",
+        alertType: "OVER_CONSUMPTION",
+        severity: "high",
+        standardValue: 4.0,
+        actualValue: 6.5,
+        mismatch: 2.5,
+        unit: "L/hr",
+        description: "Exceeded standard consumption by 2.5 L/hr",
+        machineType: "L/hr",
+        ownershipType: "Rental",
+        status: "active",
+        expectedHours: 8,
+        actualHours: 7.5,
+      },
+      {
+        id: "alert_2",
+        timestamp: new Date(now.getTime() - 2 * 60 * 60 * 1000).toISOString(),
+        machine: "CAT-09",
+        plate: "TN10CD5678",
+        alertType: "IDLE_MACHINE",
+        severity: "medium",
+        standardValue: 8.0,
+        actualValue: 5.5,
+        mismatch: -2.5,
+        unit: "hours",
+        description: "Machine was idle for 2.5 hours below expected",
+        machineType: "L/hr",
+        ownershipType: "Own",
+        status: "active",
+        expectedHours: 8,
+        actualHours: 5.5,
+      },
+      {
+        id: "alert_3",
+        timestamp: new Date(now.getTime() - 4 * 60 * 60 * 1000).toISOString(),
+        machine: "TRUCK-01",
+        plate: "KA20EF9012",
+        alertType: "UNDER_WORKED",
+        severity: "low",
+        standardValue: 10.0,
+        actualValue: 7.2,
+        mismatch: -2.8,
+        unit: "hours/day",
+        description:
+          "Machine under-utilized: averaging 7.2 hrs/day vs expected 10 hrs/day",
+        machineType: "KM/l",
+        ownershipType: "Own",
+        status: "active",
+        expectedHours: 10,
+        actualHours: 7.2,
+      },
+    ];
+
+    return {
+      recent: [mockAlerts[0]],
+      weekly: mockAlerts,
+      monthly: mockAlerts,
+      overConsumption: [mockAlerts[0]],
+      lowEfficiency: [],
+      idleMachines: [mockAlerts[1]],
+      underWorked: [mockAlerts[2]],
+      maintenanceDue: [],
+      unusualPatterns: [],
+      summary: {
+        total: 3,
+        high: 1,
+        medium: 1,
+        low: 1,
+        critical: 0,
+      },
+    };
+  }
+
+  /**
+   * Generate mock performance analytics
+   */
+  private getMockPerformanceAnalytics(): MachinePerformanceAnalytics[] {
+    return [
+      {
+        machine: "JCB-12",
+        plate: "AP09AB1234",
+        machineType: "L/hr",
+        ownershipType: "Rental",
+        totalEntries: 15,
+        avgDailyUsage: 7.5,
+        avgConsumptionRate: 6.2,
+        totalUsage: 112.5,
+        totalDiesel: 697.5,
+        efficiencyTrend: "declining",
+        alertRisk: "high",
+        recommendations: [
+          "Monitor closely for consumption anomalies",
+          "Check for fuel system issues",
+          "Schedule maintenance inspection",
+        ],
+        standardValues: {
+          expectedDaily: 8.0,
+          standardConsumption: 4.0,
+        },
+      },
+      {
+        machine: "CAT-09",
+        plate: "TN10CD5678",
+        machineType: "L/hr",
+        ownershipType: "Own",
+        totalEntries: 12,
+        avgDailyUsage: 6.8,
+        avgConsumptionRate: 3.2,
+        totalUsage: 81.6,
+        totalDiesel: 261.12,
+        efficiencyTrend: "stable",
+        alertRisk: "medium",
+        recommendations: [
+          "Machine appears under-utilized",
+          "Consider maintenance check",
+        ],
+        standardValues: {
+          expectedDaily: 8.0,
+          standardConsumption: 3.5,
+        },
+      },
+    ];
+  }
+
+  /**
+   * Generate mock performance summary
+   */
+  private getMockPerformanceSummary() {
+    return {
+      totalMachines: 2,
+      highRisk: 1,
+      mediumRisk: 1,
+      lowRisk: 0,
+      improving: 0,
+      declining: 1,
+      stable: 1,
+    };
   }
 
   // Enhanced connection checking

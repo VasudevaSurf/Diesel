@@ -20,6 +20,7 @@ import { DieselService, DieselEntry, Machine } from "@/services/DieselService";
 import { Picker } from "@react-native-picker/picker";
 import * as FileSystem from "expo-file-system";
 import * as Sharing from "expo-sharing";
+import * as Print from "expo-print";
 
 interface SummaryStats {
   totalMachines: number;
@@ -383,6 +384,259 @@ export default function ReportsScreen() {
       return mismatch > 0
         ? `🔴 +${mismatch.toFixed(2)}`
         : `🟢 ${mismatch.toFixed(2)}`;
+    }
+  };
+
+  const generatePDFHTML = () => {
+    const currentDate = new Date().toLocaleDateString();
+    const filterSummary = getFilterSummary();
+    const machineTypeStats = getMachineTypeStats();
+
+    const logRows = filteredLogs
+      .map((log) => {
+        const machine = machines.find((m) => m.name === log.machineName);
+        return `
+          <tr>
+            <td style="border: 1px solid #ddd; padding: 8px; font-size: 12px;">${
+              log.timestamp
+            }</td>
+            <td style="border: 1px solid #ddd; padding: 8px; font-size: 12px;">${generateMachineId(
+              log.machineName
+            )}</td>
+            <td style="border: 1px solid #ddd; padding: 8px; font-size: 12px;">${
+              machine?.ownershipType || "Unknown"
+            }</td>
+            <td style="border: 1px solid #ddd; padding: 8px; font-size: 12px;">${
+              log.machineType || "L/hr"
+            }</td>
+            <td style="border: 1px solid #ddd; padding: 8px; font-size: 12px;">${
+              log.startReading || 0
+            }</td>
+            <td style="border: 1px solid #ddd; padding: 8px; font-size: 12px;">${
+              log.endReading || 0
+            }</td>
+            <td style="border: 1px solid #ddd; padding: 8px; font-size: 12px;">${
+              log.usage || 0
+            }</td>
+            <td style="border: 1px solid #ddd; padding: 8px; font-size: 12px;">${
+              log.dieselFilled || 0
+            }</td>
+            <td style="border: 1px solid #ddd; padding: 8px; font-size: 12px;">${
+              log.rate || 0
+            }</td>
+            <td style="border: 1px solid #ddd; padding: 8px; font-size: 12px;">${getMismatchIndicator(
+              log
+            ).replace(/🟢|🔴/g, "")}</td>
+            <td style="border: 1px solid #ddd; padding: 8px; font-size: 12px;">${
+              log.phoneNumber || ""
+            }</td>
+            <td style="border: 1px solid #ddd; padding: 8px; font-size: 12px;">${
+              log.remarks || ""
+            }</td>
+          </tr>
+        `;
+      })
+      .join("");
+
+    const machineTypeRows = machineTypeStats
+      .map(
+        (stat) => `
+        <tr>
+          <td style="border: 1px solid #ddd; padding: 8px; font-weight: bold;">${
+            stat.type
+          }</td>
+          <td style="border: 1px solid #ddd; padding: 8px;">${stat.count}</td>
+          <td style="border: 1px solid #ddd; padding: 8px;">${stat.totalDiesel.toFixed(
+            1
+          )}L</td>
+          <td style="border: 1px solid #ddd; padding: 8px;">${stat.totalUsage.toFixed(
+            1
+          )} ${stat.type === "KM/l" ? "km" : "hrs"}</td>
+          <td style="border: 1px solid #ddd; padding: 8px;">${stat.avgEfficiency.toFixed(
+            2
+          )} ${stat.type}</td>
+          <td style="border: 1px solid #ddd; padding: 8px;">${stat.entries}</td>
+        </tr>
+      `
+      )
+      .join("");
+
+    return `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <title>Diesel Report</title>
+        <style>
+          body { font-family: Arial, sans-serif; margin: 20px; }
+          .header { text-align: center; margin-bottom: 30px; }
+          .summary-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; margin-bottom: 30px; }
+          .summary-card { background: #f8f9fa; padding: 15px; border-radius: 8px; text-align: center; border: 2px solid #e9ecef; }
+          .summary-number { font-size: 24px; font-weight: bold; color: #333; }
+          .summary-label { font-size: 14px; color: #666; margin-top: 5px; }
+          .efficiency-section { background: #667eea; color: white; padding: 20px; border-radius: 8px; margin-bottom: 30px; text-align: center; }
+          .table { width: 100%; border-collapse: collapse; margin-bottom: 30px; }
+          .table th { background-color: #f8f9fa; border: 1px solid #ddd; padding: 10px; text-align: left; font-weight: bold; }
+          .section-title { font-size: 18px; font-weight: bold; margin: 30px 0 15px 0; color: #333; }
+          .filter-info { background: #e3f2fd; padding: 15px; border-radius: 8px; margin-bottom: 20px; }
+          @media print { 
+            body { margin: 0; }
+            .table { font-size: 10px; }
+          }
+        </style>
+      </head>
+      <body>
+        <div class="header">
+          <h1>📊 Diesel Usage Report</h1>
+          <p>Generated on: ${currentDate}</p>
+          ${
+            filterSummary
+              ? `<div class="filter-info"><strong>Applied Filters:</strong> ${filterSummary}</div>`
+              : ""
+          }
+        </div>
+
+        <div class="section-title">📈 Summary Statistics</div>
+        <div class="summary-grid">
+          <div class="summary-card">
+            <div class="summary-number">${summaryStats.totalMachines}</div>
+            <div class="summary-label">Machines</div>
+          </div>
+          <div class="summary-card">
+            <div class="summary-number">${summaryStats.totalDiesel.toFixed(
+              1
+            )}L</div>
+            <div class="summary-label">Total Diesel</div>
+          </div>
+          <div class="summary-card">
+            <div class="summary-number">${summaryStats.totalUsage.toFixed(
+              1
+            )}</div>
+            <div class="summary-label">Total Usage</div>
+          </div>
+          <div class="summary-card">
+            <div class="summary-number">${summaryStats.totalEntries}</div>
+            <div class="summary-label">Entries</div>
+          </div>
+        </div>
+
+        <div class="efficiency-section">
+          <h3>Average Efficiency</h3>
+          <div style="font-size: 18px; font-weight: bold;">${
+            summaryStats.avgEfficiency.combined
+          }</div>
+          ${
+            summaryStats.avgEfficiency.lhr.count > 0 &&
+            summaryStats.avgEfficiency.kml.count > 0
+              ? `
+            <div style="margin-top: 15px; font-size: 14px;">
+              <div>L/hr machines: ${summaryStats.avgEfficiency.lhr.display}</div>
+              <div>KM/l machines: ${summaryStats.avgEfficiency.kml.display}</div>
+            </div>
+          `
+              : ""
+          }
+        </div>
+
+        ${
+          machineTypeStats.length > 0
+            ? `
+          <div class="section-title">🔧 Machine Type Breakdown</div>
+          <table class="table">
+            <thead>
+              <tr>
+                <th>Type</th>
+                <th>Machines</th>
+                <th>Total Diesel</th>
+                <th>Total Usage</th>
+                <th>Avg Efficiency</th>
+                <th>Entries</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${machineTypeRows}
+            </tbody>
+          </table>
+        `
+            : ""
+        }
+
+        <div class="section-title">📋 Detailed Diesel Logs</div>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Date & Time</th>
+              <th>Machine ID</th>
+              <th>Ownership</th>
+              <th>Type</th>
+              <th>Last Reading</th>
+              <th>Current Reading</th>
+              <th>Usage</th>
+              <th>Diesel (L)</th>
+              <th>Rate</th>
+              <th>Mismatch</th>
+              <th>Phone</th>
+              <th>Remarks</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${logRows}
+          </tbody>
+        </table>
+
+        <div style="margin-top: 40px; text-align: center; color: #666; font-size: 12px;">
+          <p>This report was generated automatically by the Diesel Management System</p>
+        </div>
+      </body>
+      </html>
+    `;
+  };
+
+  const getFilterSummary = () => {
+    const filters = [];
+    if (filterOwnership) filters.push(`Ownership: ${filterOwnership}`);
+    if (filterMachineType) filters.push(`Type: ${filterMachineType}`);
+    if (filterMachine) filters.push(`Machine: ${filterMachine}`);
+    if (filterDateFrom) filters.push(`From: ${filterDateFrom}`);
+    if (filterDateTo) filters.push(`To: ${filterDateTo}`);
+    return filters.length > 0 ? filters.join(", ") : null;
+  };
+
+  const exportToPDF = async () => {
+    try {
+      setLoading(true);
+
+      const htmlContent = generatePDFHTML();
+
+      const { uri } = await Print.printToFileAsync({
+        html: htmlContent,
+        base64: false,
+      });
+
+      const fileName = `diesel_report_${
+        new Date().toISOString().split("T")[0]
+      }.pdf`;
+      const fileUri = FileSystem.documentDirectory + fileName;
+
+      // Move the generated PDF to a permanent location
+      await FileSystem.moveAsync({
+        from: uri,
+        to: fileUri,
+      });
+
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(fileUri, {
+          mimeType: "application/pdf",
+          dialogTitle: "Share Diesel Report",
+        });
+      } else {
+        Alert.alert("Success", `PDF report saved to: ${fileName}`);
+      }
+    } catch (error) {
+      console.error("Error exporting PDF:", error);
+      Alert.alert("Error", "Failed to export PDF file");
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -802,15 +1056,31 @@ export default function ReportsScreen() {
           </View>
         </View>
 
-        {/* Export Section */}
+        {/* Enhanced Export Section */}
         <View style={styles.exportSection}>
-          <TouchableOpacity
-            style={[styles.exportButton, { backgroundColor: "#28a745" }]}
-            onPress={exportToCSV}
-          >
-            <IconSymbol name="square.and.arrow.up" size={20} color="white" />
-            <Text style={styles.exportButtonText}>Export to CSV</Text>
-          </TouchableOpacity>
+          <ThemedText style={styles.sectionTitle}>📤 Export Reports</ThemedText>
+
+          <View style={styles.exportButtons}>
+            <TouchableOpacity
+              style={[styles.exportButton, { backgroundColor: "#28a745" }]}
+              onPress={exportToCSV}
+              disabled={loading}
+            >
+              <IconSymbol name="square.and.arrow.up" size={20} color="white" />
+              <Text style={styles.exportButtonText}>Export to CSV</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[styles.exportButton, { backgroundColor: "#dc3545" }]}
+              onPress={exportToPDF}
+              disabled={loading}
+            >
+              <IconSymbol name="doc.richtext" size={20} color="white" />
+              <Text style={styles.exportButtonText}>
+                {loading ? "Generating..." : "Export to PDF"}
+              </Text>
+            </TouchableOpacity>
+          </View>
         </View>
 
         {/* Logs List */}
@@ -1047,7 +1317,12 @@ const styles = StyleSheet.create({
   exportSection: {
     marginTop: 20,
   },
+  exportButtons: {
+    flexDirection: "row",
+    gap: 10,
+  },
   exportButton: {
+    flex: 1,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
