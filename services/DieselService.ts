@@ -629,6 +629,18 @@ class EnhancedDieselServiceClass {
 
         // Start backend verification with stability delay
         this.scheduleStableBackendCheck();
+
+        // FIXED: Also schedule queue processing check after connection is restored
+        setTimeout(() => {
+          if (
+            this.connectionStatus.isConnected &&
+            this.connectionStatus.connectionStable &&
+            this.offlineQueue.length > 0
+          ) {
+            console.log("🔄 Connection restored, checking offline queue...");
+            this.processOfflineQueue();
+          }
+        }, 5000); // Give some time for backend connection to stabilize
       } else {
         console.log("❌ INTERNET LOST! Going offline...");
         this.markBackendDisconnected("No internet connection");
@@ -1896,7 +1908,7 @@ class EnhancedDieselServiceClass {
     type: QueuedItem["type"],
     data: any,
     priority: number = 1,
-    maxRetries: number = 5
+    maxRetries: number = 8 // FIXED: Increased from 5 to 8 for better retry chances
   ): Promise<string> {
     const queueItem: QueuedItem = {
       id: `${type}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
@@ -1988,6 +2000,7 @@ class EnhancedDieselServiceClass {
       const processedItems: string[] = [];
       const failedItems: QueuedItem[] = [];
       let successCount = 0;
+      let networkFailureCount = 0;
 
       // Sort queue by priority and timestamp
       const sortedQueue = [...this.offlineQueue].sort((a, b) => {
@@ -2008,29 +2021,53 @@ class EnhancedDieselServiceClass {
           );
 
           let success = false;
+          let isNetworkError = false;
 
-          switch (item.type) {
-            case "entry":
-              success = await this.processQueuedEntry(item.data);
-              break;
-            case "inventory":
-              success = await this.processQueuedInventory(item.data);
-              break;
-            case "machine":
-              success = await this.processQueuedMachine(item.data);
-              break;
-            case "machineUpdate":
-              success = await this.processQueuedMachineUpdate(item.data);
-              break;
-            case "machineDelete":
-              success = await this.processQueuedMachineDelete(item.data);
-              break;
-            case "alertUpdate":
-              success = await this.processQueuedAlertUpdate(item.data);
-              break;
-            default:
-              console.warn(`❓ Unknown queue item type: ${item.type}`);
-              success = true; // Remove unknown types
+          try {
+            switch (item.type) {
+              case "entry":
+                success = await this.processQueuedEntry(item.data);
+                break;
+              case "inventory":
+                success = await this.processQueuedInventory(item.data);
+                break;
+              case "machine":
+                success = await this.processQueuedMachine(item.data);
+                break;
+              case "machineUpdate":
+                success = await this.processQueuedMachineUpdate(item.data);
+                break;
+              case "machineDelete":
+                success = await this.processQueuedMachineDelete(item.data);
+                break;
+              case "alertUpdate":
+                success = await this.processQueuedAlertUpdate(item.data);
+                break;
+              default:
+                console.warn(`❓ Unknown queue item type: ${item.type}`);
+                success = true; // Remove unknown types
+            }
+          } catch (error) {
+            // FIXED: Detect network errors vs actual processing errors
+            const errorMessage =
+              error instanceof Error ? error.message : String(error);
+
+            isNetworkError =
+              errorMessage.includes("fetch") ||
+              errorMessage.includes("network") ||
+              errorMessage.includes("timeout") ||
+              errorMessage.includes("abort") ||
+              errorMessage.includes("connection") ||
+              errorMessage.includes("HTTP 5") || // Server errors
+              errorMessage.includes("Failed to fetch") ||
+              errorMessage.includes("NetworkError") ||
+              errorMessage.includes("ERR_NETWORK") ||
+              errorMessage.includes("ERR_INTERNET_DISCONNECTED");
+
+            console.log(
+              `❌ Error processing ${item.type}: ${errorMessage} (Network error: ${isNetworkError})`
+            );
+            success = false;
           }
 
           if (success) {
@@ -2039,23 +2076,72 @@ class EnhancedDieselServiceClass {
             console.log(`✅ Successfully processed ${item.type} ${item.id}`);
           } else {
             item.retryCount++;
-            if (item.retryCount >= item.maxRetries) {
-              console.error(
-                `🚫 Max retries reached for ${item.type} ${item.id}, removing from queue`
+
+            // FIXED: Different retry logic for network errors vs processing errors
+            if (isNetworkError) {
+              networkFailureCount++;
+              console.log(
+                `🌐 Network error for ${item.type} ${item.id}, will retry when connection improves`
               );
-              processedItems.push(item.id);
+
+              // For network errors, don't count against max retries as aggressively
+              if (item.retryCount >= item.maxRetries * 2) {
+                // Double the retries for network issues
+                console.error(
+                  `🚫 Max network retries reached for ${item.type} ${item.id}, removing from queue`
+                );
+                processedItems.push(item.id);
+              } else {
+                failedItems.push(item);
+                console.log(
+                  `⚠️ Network retry for ${item.type} ${item.id} (${
+                    item.retryCount
+                  }/${item.maxRetries * 2})`
+                );
+              }
             } else {
-              failedItems.push(item);
-              console.warn(
-                `⚠️ Failed to process ${item.type} ${item.id}, will retry later (${item.retryCount}/${item.maxRetries})`
-              );
+              // Processing/validation errors - use normal retry logic
+              if (item.retryCount >= item.maxRetries) {
+                console.error(
+                  `🚫 Max processing retries reached for ${item.type} ${item.id}, removing from queue`
+                );
+                processedItems.push(item.id);
+              } else {
+                failedItems.push(item);
+                console.warn(
+                  `⚠️ Processing retry for ${item.type} ${item.id} (${item.retryCount}/${item.maxRetries})`
+                );
+              }
             }
+          }
+
+          // FIXED: If we hit too many network errors, stop processing and wait
+          if (networkFailureCount >= 3) {
+            console.log(
+              "🔄 Multiple network errors detected, stopping queue processing to wait for stable connection"
+            );
+
+            // Add remaining items back to failed items without incrementing retry count
+            for (
+              let i = sortedQueue.indexOf(item) + 1;
+              i < sortedQueue.length;
+              i++
+            ) {
+              const remainingItem = sortedQueue[i];
+              if (!processedItems.includes(remainingItem.id)) {
+                failedItems.push(remainingItem);
+              }
+            }
+            break;
           }
 
           // Small delay between items for stability
           await new Promise((resolve) => setTimeout(resolve, 500));
         } catch (error) {
-          console.error(`❌ Error processing queue item ${item.id}:`, error);
+          console.error(
+            `💥 Unexpected error processing queue item ${item.id}:`,
+            error
+          );
           item.retryCount++;
           if (item.retryCount < item.maxRetries) {
             failedItems.push(item);
@@ -2093,8 +2179,25 @@ class EnhancedDieselServiceClass {
           `Processed: ${successCount}, ` +
           `Failed (will retry): ${failedCount}, ` +
           `Removed permanently: ${removedCount}, ` +
-          `Remaining: ${this.offlineQueue.length}`
+          `Remaining: ${this.offlineQueue.length}` +
+          (networkFailureCount > 0
+            ? `, Network errors: ${networkFailureCount}`
+            : "")
       );
+
+      // FIXED: If we had network failures, schedule another attempt sooner
+      if (networkFailureCount > 0 && this.offlineQueue.length > 0) {
+        console.log("⏰ Scheduling earlier retry due to network issues...");
+        setTimeout(() => {
+          if (
+            this.connectionStatus.isConnected &&
+            this.connectionStatus.isInternetReachable &&
+            this.connectionStatus.connectionStable
+          ) {
+            this.processOfflineQueue();
+          }
+        }, 10000); // Retry in 10 seconds instead of waiting for the full sync interval
+      }
     } catch (error) {
       console.error("💥 Error processing offline queue:", error);
     } finally {
@@ -2104,17 +2207,36 @@ class EnhancedDieselServiceClass {
 
   private async processQueuedEntry(entryData: DieselEntry): Promise<boolean> {
     try {
+      // FIXED: Double-check connection before making request
+      if (
+        !this.connectionStatus.isConnected ||
+        !this.connectionStatus.isInternetReachable ||
+        !this.connectionStatus.connectionStable
+      ) {
+        throw new Error("Connection not stable for entry processing");
+      }
+
+      console.log(`📡 Submitting queued entry for ${entryData.machineName}...`);
+
       const response = await this.makeRequest(CONFIG.APPS_SCRIPT_URL, {
         method: "POST",
         body: JSON.stringify({
           action: "submitEntryEnhanced",
           ...entryData,
+          // Ensure we acknowledge any warnings from queued entries
+          acknowledgeWarnings: true,
+          forceSubmit: true,
+          queuedSubmission: true, // Flag to indicate this is from queue
           timestamp: Date.now(),
         }),
       });
 
       if (response.success) {
-        // Update machine's last reading
+        console.log(
+          `✅ Queued entry submitted successfully for ${entryData.machineName}`
+        );
+
+        // Update machine's last reading in local cache
         const machines = await this.getMachines();
         const machine = machines.find((m) => m.name === entryData.machineName);
         if (machine) {
@@ -2123,22 +2245,46 @@ class EnhancedDieselServiceClass {
           await this.cacheData(STORAGE_KEYS.MACHINES, machines);
         }
 
-        // Update local logs cache
+        // Remove the entry from local cache if it was temporarily added
+        // (since it's now confirmed in the backend)
         const logs =
           (await this.getCachedData<DieselEntry[]>(STORAGE_KEYS.LOGS)) || [];
-        const existingIndex = logs.findIndex((log) => log.id === entryData.id);
-        if (existingIndex === -1) {
-          logs.unshift(entryData);
-          await this.cacheData(STORAGE_KEYS.LOGS, logs.slice(0, 1000));
+        const updatedLogs = logs.filter((log) => log.id !== entryData.id);
+        if (updatedLogs.length !== logs.length) {
+          await this.cacheData(STORAGE_KEYS.LOGS, updatedLogs);
         }
 
         return true;
-      }
+      } else {
+        console.error(`❌ Backend rejected queued entry: ${response.message}`);
 
-      return false;
+        // FIXED: Check if this is a validation error (permanent) vs network error (temporary)
+        const isValidationError =
+          response.message?.includes("validation") ||
+          response.message?.includes("invalid") ||
+          response.message?.includes("already exists") ||
+          response.message?.includes("not found") ||
+          response.message?.includes("required");
+
+        if (isValidationError) {
+          console.log(
+            `🚫 Validation error for queued entry, removing from queue: ${response.message}`
+          );
+          // For validation errors, we might want to remove from queue
+          // but let the caller decide based on the specific error
+          throw new Error(`VALIDATION_ERROR: ${response.message}`);
+        } else {
+          // For other errors, treat as temporary network/server issues
+          throw new Error(`SERVER_ERROR: ${response.message}`);
+        }
+      }
     } catch (error) {
-      console.error("❌ Error processing queued entry:", error);
-      return false;
+      const errorMessage =
+        error instanceof Error ? error.message : String(error);
+      console.error("❌ Error processing queued entry:", errorMessage);
+
+      // Re-throw to let the queue processor handle retry logic
+      throw error;
     }
   }
 
