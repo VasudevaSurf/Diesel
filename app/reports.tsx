@@ -28,12 +28,16 @@ interface SummaryStats {
   totalUsage: number;
   avgEfficiency: {
     lhr: {
-      average: number;
+      totalUsage: number;
+      totalDiesel: number;
+      efficiency: number;
       count: number;
       display: string;
     };
     kml: {
-      average: number;
+      totalUsage: number;
+      totalDiesel: number;
+      efficiency: number;
       count: number;
       display: string;
     };
@@ -66,8 +70,20 @@ export default function ReportsScreen() {
     totalDiesel: 0,
     totalUsage: 0,
     avgEfficiency: {
-      lhr: { average: 0, count: 0, display: "--" },
-      kml: { average: 0, count: 0, display: "--" },
+      lhr: {
+        totalUsage: 0,
+        totalDiesel: 0,
+        efficiency: 0,
+        count: 0,
+        display: "--",
+      },
+      kml: {
+        totalUsage: 0,
+        totalDiesel: 0,
+        efficiency: 0,
+        count: 0,
+        display: "--",
+      },
       combined: "--",
     },
     totalEntries: 0,
@@ -203,43 +219,54 @@ export default function ReportsScreen() {
     const uniqueMachines = new Set(filteredLogs.map((log) => log.machineName))
       .size;
 
-    // Separate efficiency calculations by machine type
-    let totalLHR = 0,
-      countLHR = 0;
-    let totalKML = 0,
-      countKML = 0;
+    // CORRECTED EFFICIENCY CALCULATION
+    // Separate totals by machine type for proper efficiency calculation
+    let lhrTotalUsage = 0,
+      lhrTotalDiesel = 0,
+      lhrCount = 0;
+    let kmlTotalUsage = 0,
+      kmlTotalDiesel = 0,
+      kmlCount = 0;
 
     filteredLogs.forEach((log) => {
       const type = log.machineType || "L/hr";
-      const rate = parseFloat(log.rate?.toString() || "0");
+      const usage = parseFloat(log.usage?.toString() || "0");
+      const diesel = parseFloat(log.dieselFilled?.toString() || "0");
 
       if (type === "L/hr") {
-        totalLHR += rate;
-        countLHR++;
+        lhrTotalUsage += usage; // Total hours
+        lhrTotalDiesel += diesel; // Total diesel for L/hr machines
+        lhrCount++;
       } else if (type === "KM/l" || type === "L/km") {
-        totalKML += rate;
-        countKML++;
+        kmlTotalUsage += usage; // Total kilometers
+        kmlTotalDiesel += diesel; // Total diesel for KM/l machines
+        kmlCount++;
       }
     });
 
-    // Calculate averages
-    const avgLHR = countLHR > 0 ? totalLHR / countLHR : 0;
-    const avgKML = countKML > 0 ? totalKML / countKML : 0;
+    // Calculate proper efficiency: Usage/Diesel for each type
+    // L/hr: Total Hours / Total Diesel = Hours per Liter
+    // KM/l: Total Kilometers / Total Diesel = Kilometers per Liter
+    const lhrEfficiency =
+      lhrTotalDiesel > 0 ? lhrTotalUsage / lhrTotalDiesel : 0;
+    const kmlEfficiency =
+      kmlTotalDiesel > 0 ? kmlTotalUsage / kmlTotalDiesel : 0;
 
     // Create display strings
-    const lhrDisplay = countLHR > 0 ? `${avgLHR.toFixed(2)} L/hr` : "--";
-    const kmlDisplay = countKML > 0 ? `${avgKML.toFixed(2)} KM/l` : "--";
+    const lhrDisplay =
+      lhrCount > 0 ? `${lhrEfficiency.toFixed(2)} hrs/L` : "--";
+    const kmlDisplay = kmlCount > 0 ? `${kmlEfficiency.toFixed(2)} km/L` : "--";
 
     // Create combined efficiency label based on what types are present
     let combinedEfficiency: string;
-    if (countLHR > 0 && countKML > 0) {
-      combinedEfficiency = `L/hr: ${avgLHR.toFixed(2)} | KM/l: ${avgKML.toFixed(
+    if (lhrCount > 0 && kmlCount > 0) {
+      combinedEfficiency = `${lhrEfficiency.toFixed(
         2
-      )}`;
-    } else if (countLHR > 0) {
-      combinedEfficiency = `${avgLHR.toFixed(2)} L/hr`;
-    } else if (countKML > 0) {
-      combinedEfficiency = `${avgKML.toFixed(2)} KM/l`;
+      )} hrs/L | ${kmlEfficiency.toFixed(2)} km/L`;
+    } else if (lhrCount > 0) {
+      combinedEfficiency = `${lhrEfficiency.toFixed(2)} hrs/L`;
+    } else if (kmlCount > 0) {
+      combinedEfficiency = `${kmlEfficiency.toFixed(2)} km/L`;
     } else {
       combinedEfficiency = "--";
     }
@@ -261,13 +288,17 @@ export default function ReportsScreen() {
       totalUsage,
       avgEfficiency: {
         lhr: {
-          average: avgLHR,
-          count: countLHR,
+          totalUsage: lhrTotalUsage,
+          totalDiesel: lhrTotalDiesel,
+          efficiency: lhrEfficiency,
+          count: lhrCount,
           display: lhrDisplay,
         },
         kml: {
-          average: avgKML,
-          count: countKML,
+          totalUsage: kmlTotalUsage,
+          totalDiesel: kmlTotalDiesel,
+          efficiency: kmlEfficiency,
+          count: kmlCount,
           display: kmlDisplay,
         },
         combined: combinedEfficiency,
@@ -299,15 +330,17 @@ export default function ReportsScreen() {
 
       stats[type].totalDiesel += log.dieselFilled || 0;
       stats[type].totalUsage += log.usage || 0;
-      stats[type].avgEfficiency += parseFloat(log.rate?.toString() || "0");
       stats[type].entries += 1;
     });
 
-    // Calculate averages and unique machine counts
+    // Calculate proper efficiency and unique machine counts
     Object.keys(stats).forEach((type) => {
       const typeStats = stats[type];
+      // Corrected efficiency calculation: Usage/Diesel
       typeStats.avgEfficiency =
-        typeStats.entries > 0 ? typeStats.avgEfficiency / typeStats.entries : 0;
+        typeStats.totalDiesel > 0
+          ? typeStats.totalUsage / typeStats.totalDiesel
+          : 0;
 
       // Count unique machines of this type
       const uniqueMachines = new Set(
@@ -454,7 +487,7 @@ export default function ReportsScreen() {
           )} ${stat.type === "KM/l" ? "km" : "hrs"}</td>
           <td style="border: 1px solid #ddd; padding: 8px;">${stat.avgEfficiency.toFixed(
             2
-          )} ${stat.type}</td>
+          )} ${stat.type === "KM/l" ? "km/L" : "hrs/L"}</td>
           <td style="border: 1px solid #ddd; padding: 8px;">${stat.entries}</td>
         </tr>
       `
@@ -521,7 +554,7 @@ export default function ReportsScreen() {
         </div>
 
         <div class="efficiency-section">
-          <h3>Average Efficiency</h3>
+          <h3>Average Efficiency (Usage ÷ Diesel)</h3>
           <div style="font-size: 18px; font-weight: bold;">${
             summaryStats.avgEfficiency.combined
           }</div>
@@ -549,7 +582,7 @@ export default function ReportsScreen() {
                 <th>Machines</th>
                 <th>Total Diesel</th>
                 <th>Total Usage</th>
-                <th>Avg Efficiency</th>
+                <th>Efficiency (Usage÷Diesel)</th>
                 <th>Entries</th>
               </tr>
             </thead>
@@ -678,7 +711,7 @@ export default function ReportsScreen() {
         }),
       ].join("\n");
 
-      // Add summary statistics to CSV
+      // Add summary statistics to CSV with corrected efficiency
       const summaryData = [
         "",
         "SUMMARY STATISTICS",
@@ -841,9 +874,10 @@ export default function ReportsScreen() {
           </Text>
         </View>
         <View style={styles.typeStatRow}>
-          <Text style={styles.typeStatLabel}>Avg Efficiency:</Text>
+          <Text style={styles.typeStatLabel}>Efficiency (Usage÷Diesel):</Text>
           <Text style={[styles.typeStatValue, styles.efficiencyValue]}>
-            {typeStats.avgEfficiency.toFixed(2)} {typeStats.type}
+            {typeStats.avgEfficiency.toFixed(2)}{" "}
+            {typeStats.type === "KM/l" ? "km/L" : "hrs/L"}
           </Text>
         </View>
         <View style={styles.typeStatRow}>
@@ -907,14 +941,16 @@ export default function ReportsScreen() {
             </View>
           </View>
 
-          {/* Enhanced Efficiency Card */}
+          {/* UPDATED Efficiency Card */}
           <View style={styles.efficiencyCard}>
-            <Text style={styles.efficiencyLabel}>Average Efficiency</Text>
+            <Text style={styles.efficiencyLabel}>
+              Average Efficiency (Usage ÷ Diesel)
+            </Text>
             <Text style={styles.efficiencyValue}>
               {summaryStats.avgEfficiency.combined}
             </Text>
 
-            {/* Breakdown when both types exist */}
+            {/* Enhanced Breakdown with detailed calculation info */}
             {summaryStats.avgEfficiency.lhr.count > 0 &&
               summaryStats.avgEfficiency.kml.count > 0 && (
                 <View style={styles.efficiencyBreakdown}>
@@ -926,6 +962,14 @@ export default function ReportsScreen() {
                       {summaryStats.avgEfficiency.lhr.display}
                     </Text>
                   </View>
+                  <View style={styles.efficiencyBreakdownSubtext}>
+                    <Text style={styles.efficiencyBreakdownSubText}>
+                      ({summaryStats.avgEfficiency.lhr.totalUsage.toFixed(1)}{" "}
+                      hrs ÷{" "}
+                      {summaryStats.avgEfficiency.lhr.totalDiesel.toFixed(1)} L)
+                    </Text>
+                  </View>
+
                   <View style={styles.efficiencyBreakdownItem}>
                     <Text style={styles.efficiencyBreakdownLabel}>
                       KM/l machines:
@@ -934,6 +978,34 @@ export default function ReportsScreen() {
                       {summaryStats.avgEfficiency.kml.display}
                     </Text>
                   </View>
+                  <View style={styles.efficiencyBreakdownSubtext}>
+                    <Text style={styles.efficiencyBreakdownSubText}>
+                      ({summaryStats.avgEfficiency.kml.totalUsage.toFixed(1)} km
+                      ÷ {summaryStats.avgEfficiency.kml.totalDiesel.toFixed(1)}{" "}
+                      L)
+                    </Text>
+                  </View>
+                </View>
+              )}
+
+            {/* Show breakdown for single type as well */}
+            {summaryStats.avgEfficiency.lhr.count > 0 &&
+              summaryStats.avgEfficiency.kml.count === 0 && (
+                <View style={styles.efficiencyBreakdown}>
+                  <Text style={styles.efficiencyBreakdownSubText}>
+                    {summaryStats.avgEfficiency.lhr.totalUsage.toFixed(1)} hrs ÷{" "}
+                    {summaryStats.avgEfficiency.lhr.totalDiesel.toFixed(1)} L
+                  </Text>
+                </View>
+              )}
+
+            {summaryStats.avgEfficiency.kml.count > 0 &&
+              summaryStats.avgEfficiency.lhr.count === 0 && (
+                <View style={styles.efficiencyBreakdown}>
+                  <Text style={styles.efficiencyBreakdownSubText}>
+                    {summaryStats.avgEfficiency.kml.totalUsage.toFixed(1)} km ÷{" "}
+                    {summaryStats.avgEfficiency.kml.totalDiesel.toFixed(1)} L
+                  </Text>
                 </View>
               )}
           </View>
@@ -1201,6 +1273,15 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: "600",
     color: "white",
+  },
+  efficiencyBreakdownSubtext: {
+    alignItems: "center",
+    marginTop: 2,
+  },
+  efficiencyBreakdownSubText: {
+    fontSize: 11,
+    color: "rgba(255, 255, 255, 0.7)",
+    fontStyle: "italic",
   },
   machineTypeSection: {
     marginBottom: 20,

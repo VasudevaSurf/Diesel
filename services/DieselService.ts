@@ -1,4 +1,4 @@
-// Enhanced DieselService.ts - Fixed Warning Submission and Mismatch Data
+// Enhanced DieselService.ts - FIXED Connection Management and Stable Data States
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import NetInfo from "@react-native-community/netinfo";
 import * as Network from "expo-network";
@@ -9,12 +9,14 @@ const CONFIG = {
     "https://script.google.com/macros/s/AKfycbxXBRh7D7kZMrFbZfANGg_BXYJp2ibDRdM_YOCRgr9Nt39Fvn6HPvFK1MbmASG6zjSs/exec",
   ADMIN_PASSWORD: "admin123",
   INVENTORY_PASSWORD: "inventory456",
-  TIMEOUT: 10000, // 10 seconds
+  TIMEOUT: 15000, // Increased to 15 seconds for better stability
   RETRY_ATTEMPTS: 3,
-  CACHE_DURATION: 5 * 60 * 1000, // 5 minutes
-  SYNC_INTERVAL: 30000, // 30 seconds
-  CONNECTION_CHECK_INTERVAL: 3000, // 3 seconds
-  PING_CHECK_INTERVAL: 1000, // 1 second for very fast detection
+  CACHE_DURATION: 10 * 60 * 1000, // Increased to 10 minutes
+  SYNC_INTERVAL: 60000, // Increased to 60 seconds to reduce flickering
+  CONNECTION_CHECK_INTERVAL: 5000, // Increased to 5 seconds
+  BACKEND_CHECK_INTERVAL: 10000, // New: separate interval for backend checks
+  PING_CHECK_INTERVAL: 2000, // Reduced frequency for backup monitoring
+  CONNECTION_STABILITY_DELAY: 3000, // New: wait before changing connection status
 };
 
 // Storage Keys
@@ -32,7 +34,10 @@ const STORAGE_KEYS = {
   CACHED_DATA_TIMESTAMP: "@diesel_tracker:cached_data_timestamp",
   HAS_REAL_DATA: "@diesel_tracker:has_real_data",
   ALERTS: "@diesel_tracker:alerts",
-  MISMATCH_DATA: "@diesel_tracker:mismatch_data", // NEW: For mismatch calculations
+  MISMATCH_DATA: "@diesel_tracker:mismatch_data",
+  // New: Connection stability tracking
+  CONNECTION_HISTORY: "@diesel_tracker:connection_history",
+  LAST_SUCCESSFUL_FETCH: "@diesel_tracker:last_successful_fetch",
 };
 
 const DEBUG_MODE = __DEV__;
@@ -57,6 +62,11 @@ export interface EnhancedConnectionStatus extends ConnectionStatus {
     logs: string;
     alerts: string;
   };
+  // New: Connection stability tracking
+  connectionStable?: boolean;
+  lastStableConnection?: string;
+  consecutiveFailures?: number;
+  backendRetryCount?: number;
 }
 
 const loadingListeners: ((state: LoadingState) => void)[] = [];
@@ -97,10 +107,10 @@ export interface DieselEntry {
   expectedDaily?: number;
   createdAt?: string;
   updatedAt?: string;
-  // NEW: Dispenser readings
+  // Dispenser readings
   dispenserStartReading?: number;
   dispenserEndReading?: number;
-  // NEW: Warning flags
+  // Warning flags
   hasWarnings?: boolean;
   warningTypes?: string[];
   warningMessages?: string[];
@@ -170,7 +180,6 @@ export interface IdleMachineAlert {
   description: string;
 }
 
-// NEW: Additional alert types
 export interface UnderWorkedAlert {
   machine: string;
   plate?: string;
@@ -199,15 +208,14 @@ export interface LowEfficiencyAlert {
   description: string;
 }
 
-// NEW: Mismatch data structure
 export interface MismatchData {
   id: string;
   machineName: string;
   plate: string;
   machineType: string;
   timestamp: string;
-  consumptionMismatch: number; // Actual rate - Standard rate
-  hoursMismatch: number; // Actual hours - Expected hours
+  consumptionMismatch: number;
+  hoursMismatch: number;
   standardConsumption: number;
   actualConsumption: number;
   standardHours: number;
@@ -231,7 +239,6 @@ export interface ApiResponse<T = any> {
   hasLogs?: boolean;
   requiresConfirmation?: boolean;
   deletedMachine?: any;
-  // NEW: Warning-related fields
   hasWarnings?: boolean;
   warningMessages?: string[];
   warningTypes?: string[];
@@ -291,7 +298,6 @@ export interface AlertItem {
   status: "active" | "resolved" | "acknowledged";
   expectedHours?: number;
   actualHours?: number;
-  // NEW: Enhanced mismatch display
   consumptionMismatch?: number;
   hoursMismatch?: number;
   mismatchDisplay?: string;
@@ -329,6 +335,11 @@ class EnhancedDieselServiceClass {
       logs: "",
       alerts: "",
     },
+    // New stability tracking
+    connectionStable: false,
+    lastStableConnection: "",
+    consecutiveFailures: 0,
+    backendRetryCount: 0,
   };
 
   private currentLoadingState: LoadingState = {
@@ -340,10 +351,19 @@ class EnhancedDieselServiceClass {
   private isProcessingQueue: boolean = false;
   private syncInterval: NodeJS.Timeout | null = null;
   private connectionCheckInterval: NodeJS.Timeout | null = null;
+  private backendCheckInterval: NodeJS.Timeout | null = null;
   private realTimeCheckInterval: NodeJS.Timeout | null = null;
   private netInfoUnsubscribe: (() => void) | null = null;
   private lastNetworkState: any = null;
   private isInitialized: boolean = false;
+
+  // New: Connection stability tracking
+  private connectionStabilityTimeout: NodeJS.Timeout | null = null;
+  private lastBackendSuccess: number = 0;
+  private pendingConnectionChange: {
+    isConnected: boolean;
+    timestamp: number;
+  } | null = null;
 
   constructor() {
     this.initializeService();
@@ -351,7 +371,6 @@ class EnhancedDieselServiceClass {
 
   addLoadingListener(callback: (state: LoadingState) => void): () => void {
     loadingListeners.push(callback);
-    // Immediately call with current state
     callback(this.currentLoadingState);
 
     return () => {
@@ -388,24 +407,23 @@ class EnhancedDieselServiceClass {
 
     this.connectionStatus.loadingState = this.currentLoadingState;
 
-    console.log(
-      `🔄 Loading: ${operation} - ${isLoading ? "Started" : "Completed"}${
-        message ? ` (${message})` : ""
-      }${progress ? ` - ${progress}%` : ""}`
-    );
+    if (DEBUG_MODE) {
+      console.log(
+        `🔄 Loading: ${operation} - ${isLoading ? "Started" : "Completed"}${
+          message ? ` (${message})` : ""
+        }${progress ? ` - ${progress}%` : ""}`
+      );
+    }
 
     this.notifyLoadingListeners();
   }
 
-  // Add connection listener for real-time updates
   addConnectionListener(
     callback: (status: ConnectionStatus) => void
   ): () => void {
     connectionListeners.push(callback);
-    // Immediately call with current status
     callback(this.connectionStatus);
 
-    // Return unsubscribe function
     return () => {
       const index = connectionListeners.indexOf(callback);
       if (index > -1) {
@@ -414,7 +432,6 @@ class EnhancedDieselServiceClass {
     };
   }
 
-  // Notify all listeners of status changes
   private notifyConnectionListeners(): void {
     connectionListeners.forEach((listener) => {
       try {
@@ -425,28 +442,32 @@ class EnhancedDieselServiceClass {
     });
   }
 
-  // Enhanced initialization with immediate real-time monitoring
+  // FIXED: Enhanced initialization with stable monitoring
   private async initializeService(): Promise<void> {
     try {
-      console.log("🚀 Initializing DieselService with real-time monitoring...");
+      console.log(
+        "🚀 Initializing Enhanced DieselService with stable monitoring..."
+      );
 
       // Load cached data first
       await this.loadCachedData();
 
-      // Start IMMEDIATE real-time network monitoring
-      this.startAggressiveNetworkMonitoring();
+      // Start network monitoring with stability checks
+      this.startStableNetworkMonitoring();
 
-      // Start connection checking
-      this.startConnectionChecking();
+      // Start connection checking with proper intervals
+      this.startStableConnectionChecking();
 
-      // Start auto-sync
+      // Start auto-sync with reduced frequency
       this.startAutoSync();
 
-      // Initial connection check (non-blocking)
-      this.performInitialConnectionCheck();
+      // Initial connection check (non-blocking with stability)
+      this.performStableInitialCheck();
 
       this.isInitialized = true;
-      console.log("✅ DieselService initialized with real-time monitoring");
+      console.log(
+        "✅ Enhanced DieselService initialized with stable monitoring"
+      );
     } catch (error) {
       console.error("❌ Failed to initialize service:", error);
       this.isInitialized = true;
@@ -455,16 +476,19 @@ class EnhancedDieselServiceClass {
 
   private async loadCachedData(): Promise<void> {
     try {
-      // Load connection status but always start as disconnected
-      const cachedStatus = await this.getCachedData<ConnectionStatus>(
+      // Load connection status but mark as disconnected initially
+      const cachedStatus = await this.getCachedData<EnhancedConnectionStatus>(
         STORAGE_KEYS.CONNECTION_STATUS
       );
       if (cachedStatus) {
         this.connectionStatus = {
           ...cachedStatus,
-          isConnected: false, // Always start as disconnected until verified
-          isInternetReachable: false, // Will be updated by network monitoring
+          isConnected: false, // Always start disconnected
+          isInternetReachable: false, // Will be updated by monitoring
           lastChecked: new Date().toISOString(),
+          connectionStable: false, // Reset stability
+          consecutiveFailures: 0,
+          backendRetryCount: 0,
         };
       }
 
@@ -482,70 +506,80 @@ class EnhancedDieselServiceClass {
         this.offlineQueue = cachedQueue;
       }
 
+      // Load last successful fetch timestamp
+      const lastSuccessfulFetch = await this.getCachedData<number>(
+        STORAGE_KEYS.LAST_SUCCESSFUL_FETCH
+      );
+      if (lastSuccessfulFetch) {
+        this.lastBackendSuccess = lastSuccessfulFetch;
+      }
+
       console.log(
-        `💾 Loaded cache - Has real data: ${this.connectionStatus.hasRealData}, Queue: ${this.offlineQueue.length} items`
+        `💾 Loaded cache - Has real data: ${
+          this.connectionStatus.hasRealData
+        }, Queue: ${this.offlineQueue.length} items, Last success: ${new Date(
+          this.lastBackendSuccess
+        ).toLocaleString()}`
       );
     } catch (error) {
       console.error("❌ Failed to load cached data:", error);
     }
   }
 
-  // AGGRESSIVE real-time network monitoring with immediate updates
-  private startAggressiveNetworkMonitoring(): void {
-    console.log("🔥 Starting AGGRESSIVE real-time network monitoring...");
+  // FIXED: Stable network monitoring with reduced sensitivity
+  private startStableNetworkMonitoring(): void {
+    console.log("🔥 Starting STABLE network monitoring...");
 
     try {
-      // Primary monitoring with NetInfo (most reliable)
+      // Primary monitoring with NetInfo
       this.netInfoUnsubscribe = NetInfo.addEventListener((state) => {
-        console.log("🔄 IMMEDIATE Network change detected:", {
+        console.log("📡 Network state detected:", {
           type: state.type,
           isConnected: state.isConnected,
           isInternetReachable: state.isInternetReachable,
           timestamp: new Date().toISOString(),
         });
 
-        this.handleNetworkStateChange(state);
+        this.handleNetworkStateChangeStable(state);
       });
 
-      // Also get immediate current state
+      // Get initial state
       NetInfo.fetch()
         .then((state) => {
-          console.log("📡 Initial network state:", state);
-          this.handleNetworkStateChange(state);
+          console.log("📊 Initial network state:", state);
+          this.handleNetworkStateChangeStable(state);
         })
         .catch((error) => {
           console.error("❌ Failed to get initial NetInfo state:", error);
-          this.fallbackToExpoNetworking();
+          this.fallbackToExpoNetworkingStable();
         });
     } catch (error) {
-      console.error("❌ NetInfo setup failed, using fallback:", error);
-      this.fallbackToExpoNetworking();
+      console.error("❌ NetInfo setup failed, using stable fallback:", error);
+      this.fallbackToExpoNetworkingStable();
     }
 
-    // Ultra-fast backup monitoring for instant detection
+    // Reduced frequency backup monitoring
     this.realTimeCheckInterval = setInterval(async () => {
       try {
-        // Quick network check with expo-network as backup
         const expoState = await Network.getNetworkStateAsync();
 
+        // Only update if there's a significant change
         if (
           expoState.isInternetReachable !==
           this.connectionStatus.isInternetReachable
         ) {
-          console.log(
-            "⚡ BACKUP: Network state mismatch detected, updating..."
-          );
-          this.handleNetworkStateChange(expoState);
+          console.log("⚡ BACKUP: Significant network change detected");
+          this.handleNetworkStateChangeStable(expoState);
         }
       } catch (error) {
-        // Silent error - this is just backup monitoring
+        // Silent error for backup monitoring
       }
     }, CONFIG.PING_CHECK_INTERVAL);
   }
 
-  // Fallback method when NetInfo fails
-  private fallbackToExpoNetworking(): void {
-    console.log("🔄 Using Expo Network as primary monitoring...");
+  // FIXED: Stable fallback networking
+  private fallbackToExpoNetworkingStable(): void {
+    console.log("🔄 Using Expo Network as stable primary monitoring...");
 
     this.realTimeCheckInterval = setInterval(async () => {
       try {
@@ -556,27 +590,28 @@ class EnhancedDieselServiceClass {
           ? `${this.lastNetworkState.type}_${this.lastNetworkState.isConnected}_${this.lastNetworkState.isInternetReachable}`
           : null;
 
+        // Only process if state actually changed
         if (currentStateKey !== lastStateKey) {
-          console.log("🔄 Network state changed (Expo):", {
+          console.log("🔄 Stable network state changed (Expo):", {
             from: this.lastNetworkState,
             to: networkState,
             timestamp: new Date().toISOString(),
           });
 
-          this.handleNetworkStateChange(networkState);
+          this.handleNetworkStateChangeStable(networkState);
           this.lastNetworkState = networkState;
         }
       } catch (error) {
-        console.error("❌ Error in Expo network monitoring:", error);
+        console.error("❌ Error in stable Expo network monitoring:", error);
       }
     }, CONFIG.PING_CHECK_INTERVAL);
   }
 
-  // Unified network state change handler
-  private handleNetworkStateChange(state: any): void {
+  // FIXED: Stable network state change handler
+  private handleNetworkStateChangeStable(state: any): void {
     const wasInternetReachable = this.connectionStatus.isInternetReachable;
 
-    // Update status IMMEDIATELY
+    // Update internet status immediately but backend status with stability
     this.connectionStatus = {
       ...this.connectionStatus,
       isInternetReachable: state.isInternetReachable ?? false,
@@ -585,55 +620,111 @@ class EnhancedDieselServiceClass {
       lastChecked: new Date().toISOString(),
     };
 
-    // If internet connection changed
+    // Handle internet connectivity changes
     if (wasInternetReachable !== state.isInternetReachable) {
       if (state.isInternetReachable) {
-        console.log("🌟 INTERNET RESTORED! Checking backend...");
-        // Remove any previous error
+        console.log("🌟 INTERNET RESTORED! Starting backend verification...");
         this.connectionStatus.error = undefined;
+        this.connectionStatus.consecutiveFailures = 0;
 
-        // Check backend connection IMMEDIATELY
-        setTimeout(() => {
-          this.checkBackendConnection().then((isBackendConnected) => {
-            if (isBackendConnected && this.offlineQueue.length > 0) {
-              console.log("⚡ Backend connected! Processing offline queue...");
-              this.processOfflineQueue();
-            }
-          });
-        }, 500); // Very short delay
+        // Start backend verification with stability delay
+        this.scheduleStableBackendCheck();
       } else {
         console.log("❌ INTERNET LOST! Going offline...");
-        this.connectionStatus.isConnected = false;
-        this.connectionStatus.error = "No internet connection";
+        this.markBackendDisconnected("No internet connection");
       }
     }
 
-    // IMMEDIATELY cache and notify listeners
+    // Always cache and notify for network changes
     this.cacheData(STORAGE_KEYS.CONNECTION_STATUS, this.connectionStatus);
     this.notifyConnectionListeners();
   }
 
-  private startConnectionChecking(): void {
-    this.connectionCheckInterval = setInterval(async () => {
-      // Only check backend if we have internet
-      if (this.connectionStatus.isInternetReachable) {
-        const wasConnected = this.connectionStatus.isConnected;
-        const isConnected = await this.checkBackendConnection();
+  // NEW: Schedule stable backend check with delay
+  private scheduleStableBackendCheck(): void {
+    // Clear any pending connection change
+    if (this.connectionStabilityTimeout) {
+      clearTimeout(this.connectionStabilityTimeout);
+    }
 
-        // Notify listeners if connection status changed
-        if (wasConnected !== isConnected) {
-          this.notifyConnectionListeners();
-        }
-      } else {
-        // If no internet, ensure backend is marked as disconnected
-        if (this.connectionStatus.isConnected) {
-          this.connectionStatus.isConnected = false;
-          this.connectionStatus.error = "No internet connection";
-          this.cacheData(STORAGE_KEYS.CONNECTION_STATUS, this.connectionStatus);
-          this.notifyConnectionListeners();
+    // Schedule backend check after stability delay
+    this.connectionStabilityTimeout = setTimeout(async () => {
+      if (this.connectionStatus.isInternetReachable) {
+        console.log("🔍 Performing delayed stable backend check...");
+        const isBackendConnected = await this.checkBackendConnectionStable();
+
+        if (isBackendConnected && this.offlineQueue.length > 0) {
+          console.log("⚡ Backend verified stable! Processing queue...");
+          setTimeout(() => this.processOfflineQueue(), 1000);
         }
       }
+    }, CONFIG.CONNECTION_STABILITY_DELAY);
+  }
+
+  // FIXED: Stable connection checking with separate intervals
+  private startStableConnectionChecking(): void {
+    // Internet connectivity monitoring (frequent but stable)
+    this.connectionCheckInterval = setInterval(async () => {
+      try {
+        const networkState = await NetInfo.fetch();
+        if (!networkState.isInternetReachable) {
+          if (this.connectionStatus.isConnected) {
+            console.log("⚠️ Internet lost, marking backend as disconnected");
+            this.markBackendDisconnected("Internet connection lost");
+          }
+        }
+      } catch (error) {
+        console.error("❌ Error checking internet connectivity:", error);
+      }
     }, CONFIG.CONNECTION_CHECK_INTERVAL);
+
+    // Backend connectivity monitoring (less frequent, more stable)
+    this.backendCheckInterval = setInterval(async () => {
+      // Only check backend if we have internet
+      if (this.connectionStatus.isInternetReachable) {
+        // Check if we should verify backend connection
+        const timeSinceLastSuccess = Date.now() - this.lastBackendSuccess;
+
+        // Only check backend if:
+        // 1. We're not currently connected, OR
+        // 2. It's been a while since last successful connection
+        if (
+          !this.connectionStatus.isConnected ||
+          timeSinceLastSuccess > CONFIG.BACKEND_CHECK_INTERVAL * 2
+        ) {
+          const wasConnected = this.connectionStatus.isConnected;
+          const isConnected = await this.checkBackendConnectionStable();
+
+          // Only notify if connection status actually changed
+          if (wasConnected !== isConnected) {
+            console.log(
+              `🔄 Backend connection changed: ${wasConnected} → ${isConnected}`
+            );
+            this.notifyConnectionListeners();
+          }
+        }
+      }
+    }, CONFIG.BACKEND_CHECK_INTERVAL);
+  }
+
+  // NEW: Mark backend as disconnected with proper error handling
+  private markBackendDisconnected(reason: string): void {
+    const wasConnected = this.connectionStatus.isConnected;
+
+    this.connectionStatus = {
+      ...this.connectionStatus,
+      isConnected: false,
+      error: reason,
+      connectionStable: false,
+      consecutiveFailures: (this.connectionStatus.consecutiveFailures || 0) + 1,
+      lastChecked: new Date().toISOString(),
+    };
+
+    if (wasConnected) {
+      console.log(`❌ Backend marked as disconnected: ${reason}`);
+      this.cacheData(STORAGE_KEYS.CONNECTION_STATUS, this.connectionStatus);
+      this.notifyConnectionListeners();
+    }
   }
 
   private startAutoSync(): void {
@@ -641,6 +732,7 @@ class EnhancedDieselServiceClass {
       if (
         this.connectionStatus.isConnected &&
         this.connectionStatus.isInternetReachable &&
+        this.connectionStatus.connectionStable &&
         this.offlineQueue.length > 0
       ) {
         console.log("🔄 Auto-sync: Processing offline queue...");
@@ -649,15 +741,20 @@ class EnhancedDieselServiceClass {
     }, CONFIG.SYNC_INTERVAL);
   }
 
-  // Non-blocking initial connection check
-  private async performInitialConnectionCheck(): Promise<void> {
-    console.log("🔍 Performing initial connection check...");
+  // FIXED: Stable initial connection check
+  private async performStableInitialCheck(): Promise<void> {
+    console.log("🔍 Performing stable initial connection check...");
 
     try {
-      // Get current network state
+      // Get current network state with timeout
       let networkState;
       try {
-        networkState = await NetInfo.fetch();
+        const networkPromise = NetInfo.fetch();
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("NetInfo timeout")), 5000)
+        );
+
+        networkState = await Promise.race([networkPromise, timeoutPromise]);
       } catch (error) {
         console.log("⚠️ NetInfo fetch failed, using Expo Network...");
         networkState = await Network.getNetworkStateAsync();
@@ -665,7 +762,7 @@ class EnhancedDieselServiceClass {
 
       console.log("📶 Initial network state:", networkState);
 
-      // Update status based on network state
+      // Update internet status
       this.connectionStatus = {
         ...this.connectionStatus,
         isInternetReachable: networkState.isInternetReachable ?? false,
@@ -673,14 +770,19 @@ class EnhancedDieselServiceClass {
         lastChecked: new Date().toISOString(),
       };
 
+      // Check backend only if we have internet
       if (networkState.isInternetReachable) {
-        // Check backend connection
-        const isBackendConnected = await this.checkBackendConnection();
-        console.log(
-          `🔗 Initial backend check: ${
-            isBackendConnected ? "✅ Connected" : "❌ Failed"
-          }`
-        );
+        console.log("🔗 Internet available, checking backend...");
+
+        // Add delay for stability
+        setTimeout(async () => {
+          const isBackendConnected = await this.checkBackendConnectionStable();
+          console.log(
+            `🔗 Initial backend check: ${
+              isBackendConnected ? "✅ Connected" : "❌ Failed"
+            }`
+          );
+        }, 2000);
       } else {
         console.log("❌ No internet connection on startup");
         this.connectionStatus.isConnected = false;
@@ -741,19 +843,7 @@ class EnhancedDieselServiceClass {
       console.log("📶 Current network state:", netInfoState);
 
       if (!netInfoState.isInternetReachable) {
-        this.connectionStatus = {
-          ...this.connectionStatus,
-          isConnected: false,
-          isInternetReachable: false,
-          lastChecked: new Date().toISOString(),
-          error: "No internet connection",
-          networkType: netInfoState.type,
-        };
-        await this.cacheData(
-          STORAGE_KEYS.CONNECTION_STATUS,
-          this.connectionStatus
-        );
-        this.notifyConnectionListeners();
+        this.markBackendDisconnected("No internet connection");
         this.setLoadingState(
           false,
           "checkConnection",
@@ -775,14 +865,14 @@ class EnhancedDieselServiceClass {
       this.connectionStatus.networkType = netInfoState.type;
       this.connectionStatus.error = undefined;
 
-      // Check backend connection
+      // Check backend connection with stability
       this.setLoadingState(
         true,
         "checkConnection",
         "Testing backend connection...",
         80
       );
-      const isConnected = await this.checkBackendConnection();
+      const isConnected = await this.checkBackendConnectionStable();
 
       this.setLoadingState(
         false,
@@ -794,18 +884,9 @@ class EnhancedDieselServiceClass {
       return isConnected;
     } catch (error) {
       console.error("❌ Connection check failed:", error);
-      this.connectionStatus = {
-        ...this.connectionStatus,
-        isConnected: false,
-        isInternetReachable: false,
-        lastChecked: new Date().toISOString(),
-        error: error instanceof Error ? error.message : "Unknown error",
-      };
-      await this.cacheData(
-        STORAGE_KEYS.CONNECTION_STATUS,
-        this.connectionStatus
+      this.markBackendDisconnected(
+        error instanceof Error ? error.message : "Unknown error"
       );
-      this.notifyConnectionListeners();
       this.setLoadingState(false, "checkConnection", "Connection check failed");
       return false;
     }
@@ -815,7 +896,6 @@ class EnhancedDieselServiceClass {
     return { ...this.currentLoadingState };
   }
 
-  // Get loading state for specific operation
   isOperationLoading(operation: string): boolean {
     return (
       this.currentLoadingState.isLoading &&
@@ -823,12 +903,10 @@ class EnhancedDieselServiceClass {
     );
   }
 
-  // Clear loading state (useful for error handling)
   clearLoadingState(): void {
     this.setLoadingState(false, "idle");
   }
 
-  // Get data freshness info
   getDataFreshness(): { [key: string]: { age: number; source: string } } {
     const now = Date.now();
     const lastFetch = this.connectionStatus.lastDataFetch || {};
@@ -839,7 +917,8 @@ class EnhancedDieselServiceClass {
           ? now - new Date(lastFetch.machines).getTime()
           : -1,
         source: this.connectionStatus.hasRealData
-          ? this.connectionStatus.isConnected
+          ? this.connectionStatus.isConnected &&
+            this.connectionStatus.connectionStable
             ? "live"
             : "cached"
           : "demo",
@@ -849,7 +928,8 @@ class EnhancedDieselServiceClass {
           ? now - new Date(lastFetch.inventory).getTime()
           : -1,
         source: this.connectionStatus.hasRealData
-          ? this.connectionStatus.isConnected
+          ? this.connectionStatus.isConnected &&
+            this.connectionStatus.connectionStable
             ? "live"
             : "cached"
           : "demo",
@@ -857,7 +937,8 @@ class EnhancedDieselServiceClass {
       logs: {
         age: lastFetch.logs ? now - new Date(lastFetch.logs).getTime() : -1,
         source: this.connectionStatus.hasRealData
-          ? this.connectionStatus.isConnected
+          ? this.connectionStatus.isConnected &&
+            this.connectionStatus.connectionStable
             ? "live"
             : "cached"
           : "demo",
@@ -865,7 +946,8 @@ class EnhancedDieselServiceClass {
       alerts: {
         age: lastFetch.alerts ? now - new Date(lastFetch.alerts).getTime() : -1,
         source: this.connectionStatus.hasRealData
-          ? this.connectionStatus.isConnected
+          ? this.connectionStatus.isConnected &&
+            this.connectionStatus.connectionStable
             ? "live"
             : "cached"
           : "demo",
@@ -873,7 +955,8 @@ class EnhancedDieselServiceClass {
     };
   }
 
-  private async checkBackendConnection(): Promise<boolean> {
+  // FIXED: Stable backend connection checking
+  private async checkBackendConnectionStable(): Promise<boolean> {
     const startTime = Date.now();
 
     try {
@@ -899,27 +982,41 @@ class EnhancedDieselServiceClass {
       if (response.ok) {
         const contentType = response.headers.get("content-type");
         if (contentType && contentType.includes("application/json")) {
-          console.log(`✅ Backend connected (${latency}ms)`);
-
+          // SUCCESS: Update connection status with stability
           const wasConnected = this.connectionStatus.isConnected;
+
+          this.lastBackendSuccess = Date.now();
 
           this.connectionStatus = {
             ...this.connectionStatus,
             isConnected: true,
+            connectionStable: true,
+            lastStableConnection: new Date().toISOString(),
+            consecutiveFailures: 0,
+            backendRetryCount: 0,
             lastChecked: new Date().toISOString(),
             latency,
             error: undefined,
           };
 
+          // Cache success state
           await this.cacheData(
             STORAGE_KEYS.CONNECTION_STATUS,
             this.connectionStatus
           );
+          await this.cacheData(
+            STORAGE_KEYS.LAST_SUCCESSFUL_FETCH,
+            this.lastBackendSuccess
+          );
+
+          console.log(`✅ Backend connected and stable (${latency}ms)`);
 
           // If we just connected and have items in queue, process them
           if (!wasConnected && this.offlineQueue.length > 0) {
-            console.log("🚀 Backend connection restored, processing queue...");
-            setTimeout(() => this.processOfflineQueue(), 500);
+            console.log(
+              "🚀 Backend connection restored, scheduling queue processing..."
+            );
+            setTimeout(() => this.processOfflineQueue(), 2000); // Add delay for stability
           }
 
           return true;
@@ -934,11 +1031,17 @@ class EnhancedDieselServiceClass {
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : "Unknown error";
+
       console.log(`❌ Backend connection failed: ${errorMessage}`);
 
+      // Update failure tracking
       this.connectionStatus = {
         ...this.connectionStatus,
         isConnected: false,
+        connectionStable: false,
+        consecutiveFailures:
+          (this.connectionStatus.consecutiveFailures || 0) + 1,
+        backendRetryCount: (this.connectionStatus.backendRetryCount || 0) + 1,
         lastChecked: new Date().toISOString(),
         error: errorMessage,
       };
@@ -955,18 +1058,20 @@ class EnhancedDieselServiceClass {
     return { ...this.connectionStatus };
   }
 
-  // Enhanced data retrieval with real-time status
+  // FIXED: Enhanced data retrieval with stable connection checking
   async getMachines(): Promise<Machine[]> {
     this.setLoadingState(true, "machines", "Loading machine data...");
 
     try {
       console.log(
-        `📋 Getting machines... (Connected: ${this.connectionStatus.isConnected}, Internet: ${this.connectionStatus.isInternetReachable})`
+        `📋 Getting machines... (Connected: ${this.connectionStatus.isConnected}, Stable: ${this.connectionStatus.connectionStable}, Internet: ${this.connectionStatus.isInternetReachable})`
       );
 
+      // Use cached data if not connected OR not stable
       if (
         !this.connectionStatus.isConnected ||
-        !this.connectionStatus.isInternetReachable
+        !this.connectionStatus.isInternetReachable ||
+        !this.connectionStatus.connectionStable
       ) {
         console.log("📱 Using cached/offline data for machines");
         this.setLoadingState(true, "machines", "Loading from cache...", 50);
@@ -1085,12 +1190,13 @@ class EnhancedDieselServiceClass {
 
     try {
       console.log(
-        `📦 Getting inventory... (Connected: ${this.connectionStatus.isConnected}, Internet: ${this.connectionStatus.isInternetReachable})`
+        `📦 Getting inventory... (Connected: ${this.connectionStatus.isConnected}, Stable: ${this.connectionStatus.connectionStable}, Internet: ${this.connectionStatus.isInternetReachable})`
       );
 
       if (
         !this.connectionStatus.isConnected ||
-        !this.connectionStatus.isInternetReachable
+        !this.connectionStatus.isInternetReachable ||
+        !this.connectionStatus.connectionStable
       ) {
         console.log("📱 Using cached/offline inventory data");
         this.setLoadingState(true, "inventory", "Loading from cache...", 50);
@@ -1232,12 +1338,13 @@ class EnhancedDieselServiceClass {
 
     try {
       console.log(
-        `📊 Getting logs... (Connected: ${this.connectionStatus.isConnected}, Internet: ${this.connectionStatus.isInternetReachable})`
+        `📊 Getting logs... (Connected: ${this.connectionStatus.isConnected}, Stable: ${this.connectionStatus.connectionStable}, Internet: ${this.connectionStatus.isInternetReachable})`
       );
 
       if (
         !this.connectionStatus.isConnected ||
-        !this.connectionStatus.isInternetReachable
+        !this.connectionStatus.isInternetReachable ||
+        !this.connectionStatus.connectionStable
       ) {
         console.log("📱 Using cached/offline logs data");
         this.setLoadingState(true, "logs", "Loading from cache...", 50);
@@ -1350,7 +1457,7 @@ class EnhancedDieselServiceClass {
     }
   }
 
-  // NEW: Get mismatch data with enhanced calculations
+  // Get mismatch data with enhanced calculations
   async getMismatchData(): Promise<{
     mismatchData: MismatchData[];
     success: boolean;
@@ -1362,7 +1469,8 @@ class EnhancedDieselServiceClass {
 
       if (
         !this.connectionStatus.isConnected ||
-        !this.connectionStatus.isInternetReachable
+        !this.connectionStatus.isInternetReachable ||
+        !this.connectionStatus.connectionStable
       ) {
         console.log("📱 Using cached/offline mismatch data");
         const cached = await this.getCachedData<MismatchData[]>(
@@ -1428,7 +1536,7 @@ class EnhancedDieselServiceClass {
     }
   }
 
-  // NEW: Calculate mismatch data from local logs and machines
+  // Calculate mismatch data from local logs and machines
   private async calculateMismatchFromLocal(): Promise<MismatchData[]> {
     try {
       const [machines, logsResult] = await Promise.all([
@@ -1499,7 +1607,7 @@ class EnhancedDieselServiceClass {
     }
   }
 
-  // NEW: Calculate mismatch severity
+  // Calculate mismatch severity
   private calculateMismatchSeverity(
     consumptionMismatch: number,
     hoursMismatch: number,
@@ -1549,12 +1657,13 @@ class EnhancedDieselServiceClass {
 
     try {
       console.log(
-        `🚨 Getting alerts... (Connected: ${this.connectionStatus.isConnected}, Internet: ${this.connectionStatus.isInternetReachable})`
+        `🚨 Getting alerts... (Connected: ${this.connectionStatus.isConnected}, Stable: ${this.connectionStatus.connectionStable}, Internet: ${this.connectionStatus.isInternetReachable})`
       );
 
       if (
         !this.connectionStatus.isConnected ||
-        !this.connectionStatus.isInternetReachable
+        !this.connectionStatus.isInternetReachable ||
+        !this.connectionStatus.connectionStable
       ) {
         console.log("📱 Using cached/offline alerts data");
         this.setLoadingState(true, "alerts", "Loading from cache...", 50);
@@ -1673,7 +1782,7 @@ class EnhancedDieselServiceClass {
     }
   }
 
-  // NEW: Generate alerts from mismatch data
+  // Generate alerts from mismatch data
   private async generateAlertsFromMismatch(): Promise<AlertData> {
     try {
       const mismatchResult = await this.getMismatchData();
@@ -1815,13 +1924,14 @@ class EnhancedDieselServiceClass {
       `📝 Added ${type} to offline queue. Queue size: ${this.offlineQueue.length}`
     );
 
-    // Try to process immediately if connected
+    // Try to process immediately if connected AND stable
     if (
       this.connectionStatus.isConnected &&
-      this.connectionStatus.isInternetReachable
+      this.connectionStatus.isInternetReachable &&
+      this.connectionStatus.connectionStable
     ) {
       console.log("⚡ Attempting immediate processing...");
-      setTimeout(() => this.processOfflineQueue(), 100);
+      setTimeout(() => this.processOfflineQueue(), 2000); // Add stability delay
     }
 
     return queueItem.id;
@@ -1844,11 +1954,12 @@ class EnhancedDieselServiceClass {
     console.log("🔄 Manual retry requested...");
     if (
       this.connectionStatus.isConnected &&
-      this.connectionStatus.isInternetReachable
+      this.connectionStatus.isInternetReachable &&
+      this.connectionStatus.connectionStable
     ) {
       await this.processOfflineQueue();
     } else {
-      console.log("⚠️ Cannot retry: no connection");
+      console.log("⚠️ Cannot retry: connection not stable");
     }
   }
 
@@ -1858,11 +1969,13 @@ class EnhancedDieselServiceClass {
       return;
     }
 
+    // Only process if connection is stable
     if (
       !this.connectionStatus.isConnected ||
-      !this.connectionStatus.isInternetReachable
+      !this.connectionStatus.isInternetReachable ||
+      !this.connectionStatus.connectionStable
     ) {
-      console.log("⏸️ Cannot process queue: no connection");
+      console.log("⏸️ Cannot process queue: connection not stable");
       return;
     }
 
@@ -1939,8 +2052,8 @@ class EnhancedDieselServiceClass {
             }
           }
 
-          // Small delay between items
-          await new Promise((resolve) => setTimeout(resolve, 200));
+          // Small delay between items for stability
+          await new Promise((resolve) => setTimeout(resolve, 500));
         } catch (error) {
           console.error(`❌ Error processing queue item ${item.id}:`, error);
           item.retryCount++;
@@ -2164,7 +2277,7 @@ class EnhancedDieselServiceClass {
     }
   }
 
-  // API request method
+  // FIXED: API request method with enhanced connection tracking
   private async makeRequest<T>(
     url: string,
     options: RequestInit = {}
@@ -2207,14 +2320,34 @@ class EnhancedDieselServiceClass {
 
       const data: ApiResponse<T> = await response.json();
 
-      // Update connection status on successful request
+      // FIXED: Update connection status on successful request with stability
       if (!this.connectionStatus.isConnected) {
-        this.connectionStatus.isConnected = true;
-        this.connectionStatus.lastChecked = new Date().toISOString();
+        console.log(
+          "✅ Request successful, marking backend as connected and stable"
+        );
+
+        this.lastBackendSuccess = Date.now();
+
+        this.connectionStatus = {
+          ...this.connectionStatus,
+          isConnected: true,
+          connectionStable: true,
+          lastStableConnection: new Date().toISOString(),
+          consecutiveFailures: 0,
+          backendRetryCount: 0,
+          lastChecked: new Date().toISOString(),
+          error: undefined,
+        };
+
         await this.cacheData(
           STORAGE_KEYS.CONNECTION_STATUS,
           this.connectionStatus
         );
+        await this.cacheData(
+          STORAGE_KEYS.LAST_SUCCESSFUL_FETCH,
+          this.lastBackendSuccess
+        );
+
         this.notifyConnectionListeners();
       }
 
@@ -2222,13 +2355,21 @@ class EnhancedDieselServiceClass {
     } catch (error) {
       console.error(`💥 Request failed:`, error);
 
-      // Update connection status on failed request
+      // FIXED: Update connection status on failed request with stability tracking
       const wasConnected = this.connectionStatus.isConnected;
-      this.connectionStatus.isConnected = false;
-      this.connectionStatus.error =
-        error instanceof Error ? error.message : "Request failed";
-      this.connectionStatus.lastChecked = new Date().toISOString();
 
+      this.connectionStatus = {
+        ...this.connectionStatus,
+        isConnected: false,
+        connectionStable: false,
+        consecutiveFailures:
+          (this.connectionStatus.consecutiveFailures || 0) + 1,
+        backendRetryCount: (this.connectionStatus.backendRetryCount || 0) + 1,
+        error: error instanceof Error ? error.message : "Request failed",
+        lastChecked: new Date().toISOString(),
+      };
+
+      // Only notify and cache if status actually changed
       if (wasConnected) {
         await this.cacheData(
           STORAGE_KEYS.CONNECTION_STATUS,
@@ -2275,7 +2416,7 @@ class EnhancedDieselServiceClass {
         rate = usage > 0 ? entry.dieselFilled / usage : 0;
       }
 
-      // NEW: Check for warnings but don't prevent submission
+      // Check for warnings but don't prevent submission
       const warnings = this.checkEntryWarnings(entry, machine, usage, rate);
 
       const entryWithCalculations = {
@@ -2289,11 +2430,11 @@ class EnhancedDieselServiceClass {
         timestamp: entry.timestamp || new Date().toISOString(),
         createdAt: entry.createdAt || new Date().toISOString(),
         updatedAt: new Date().toISOString(),
-        // NEW: Add warning information
+        // Add warning information
         hasWarnings: warnings.length > 0,
         warningTypes: warnings.map((w) => w.type),
         warningMessages: warnings.map((w) => w.message),
-        // NEW: Add mismatch calculations
+        // Add mismatch calculations
         consumptionMismatch: rate - (machine.standardAvgDiesel || 0),
         hoursMismatch: usage - (machine.expectedDailyHours || 0),
         standardAvg: machine.standardAvgDiesel || 0,
@@ -2324,10 +2465,11 @@ class EnhancedDieselServiceClass {
         await this.cacheData(STORAGE_KEYS.MACHINES, machines);
       }
 
-      // NEW: Always try immediate submission even with warnings
+      // Try immediate submission if connection is stable
       if (
         this.connectionStatus.isConnected &&
-        this.connectionStatus.isInternetReachable
+        this.connectionStatus.isInternetReachable &&
+        this.connectionStatus.connectionStable
       ) {
         try {
           console.log("📡 Attempting immediate submission...");
@@ -2340,13 +2482,13 @@ class EnhancedDieselServiceClass {
             70
           );
 
-          // NEW: Include warning acknowledgment in submission
+          // Include warning acknowledgment in submission
           const response = await this.makeRequest(CONFIG.APPS_SCRIPT_URL, {
             method: "POST",
             body: JSON.stringify({
               action: "submitEntryEnhanced",
               ...entryWithCalculations,
-              // NEW: Explicit warning acknowledgment
+              // Explicit warning acknowledgment
               acknowledgeWarnings: true,
               forceSubmit: true, // Force submission even with warnings
               timestamp: Date.now(),
@@ -2409,7 +2551,7 @@ class EnhancedDieselServiceClass {
         this.setLoadingState(
           true,
           "submitEntry",
-          "No connection, queuing for later...",
+          "Connection not stable, queuing for later...",
           80
         );
       }
@@ -2436,11 +2578,15 @@ class EnhancedDieselServiceClass {
         "Entry saved locally and queued"
       );
 
+      const connectionMessage = !this.connectionStatus.isInternetReachable
+        ? "Entry saved locally and queued for submission when online."
+        : !this.connectionStatus.isConnected
+        ? "Entry saved locally and will be submitted when backend connection is restored."
+        : "Entry saved locally and will be submitted when connection stabilizes.";
+
       return {
         success: true,
-        message: this.connectionStatus.isInternetReachable
-          ? "Entry saved locally and will be submitted when backend connection is restored."
-          : "Entry saved locally and queued for submission when online.",
+        message: connectionMessage,
         hasWarnings: warnings.length > 0,
         warningMessages: warnings.map((w) => w.message),
         usage: usage,
@@ -2460,7 +2606,7 @@ class EnhancedDieselServiceClass {
     }
   }
 
-  // NEW: Check entry warnings without blocking submission
+  // Check entry warnings without blocking submission
   private checkEntryWarnings(
     entry: DieselEntry,
     machine: Machine,
@@ -2571,7 +2717,7 @@ class EnhancedDieselServiceClass {
     return warnings;
   }
 
-  // NEW: Store mismatch data locally and send to backend
+  // Store mismatch data locally and send to backend
   private async storeMismatchData(
     entry: DieselEntry,
     machine: Machine
@@ -2608,10 +2754,11 @@ class EnhancedDieselServiceClass {
         existingMismatch.slice(0, 1000)
       ); // Keep last 1000
 
-      // Try to send to backend if connected
+      // Try to send to backend if connected and stable
       if (
         this.connectionStatus.isConnected &&
-        this.connectionStatus.isInternetReachable
+        this.connectionStatus.isInternetReachable &&
+        this.connectionStatus.connectionStable
       ) {
         try {
           await this.makeRequest(CONFIG.APPS_SCRIPT_URL, {
@@ -2679,7 +2826,8 @@ class EnhancedDieselServiceClass {
 
       if (
         this.connectionStatus.isConnected &&
-        this.connectionStatus.isInternetReachable
+        this.connectionStatus.isInternetReachable &&
+        this.connectionStatus.connectionStable
       ) {
         // Try to submit immediately
         try {
@@ -2736,7 +2884,7 @@ class EnhancedDieselServiceClass {
         this.setLoadingState(
           true,
           "addInventory",
-          "No connection, queuing for later...",
+          "Connection not stable, queuing for later...",
           80
         );
       }
@@ -2755,11 +2903,15 @@ class EnhancedDieselServiceClass {
         "Inventory saved locally and queued"
       );
 
+      const connectionMessage = !this.connectionStatus.isInternetReachable
+        ? "Inventory saved locally and queued for submission when online."
+        : !this.connectionStatus.isConnected
+        ? "Inventory saved locally and will be submitted when backend connection is restored."
+        : "Inventory saved locally and will be submitted when connection stabilizes.";
+
       return {
         success: true,
-        message: this.connectionStatus.isInternetReachable
-          ? "Inventory saved locally and will be submitted when backend connection is restored."
-          : "Inventory saved locally and queued for submission when online.",
+        message: connectionMessage,
       };
     } catch (error) {
       console.error("💥 Error adding inventory:", error);
@@ -2863,7 +3015,8 @@ class EnhancedDieselServiceClass {
 
       if (
         this.connectionStatus.isConnected &&
-        this.connectionStatus.isInternetReachable
+        this.connectionStatus.isInternetReachable &&
+        this.connectionStatus.connectionStable
       ) {
         // Try to submit immediately
         try {
@@ -2928,7 +3081,7 @@ class EnhancedDieselServiceClass {
         this.setLoadingState(
           true,
           "addMachine",
-          "No connection, queuing for later...",
+          "Connection not stable, queuing for later...",
           85
         );
       }
@@ -2943,11 +3096,15 @@ class EnhancedDieselServiceClass {
         "Machine saved locally and queued"
       );
 
+      const connectionMessage = !this.connectionStatus.isInternetReachable
+        ? "Machine saved locally and queued for submission when online."
+        : !this.connectionStatus.isConnected
+        ? "Machine saved locally and will be submitted when backend connection is restored."
+        : "Machine saved locally and will be submitted when connection stabilizes.";
+
       return {
         success: true,
-        message: this.connectionStatus.isInternetReachable
-          ? "Machine saved locally and will be submitted when backend connection is restored."
-          : "Machine saved locally and queued for submission when online.",
+        message: connectionMessage,
         machineId: `${machineWithMeta.name}-${machineWithMeta.plate}`,
         machineName: machineWithMeta.name,
         machinePlate: machineWithMeta.plate,
@@ -2964,7 +3121,7 @@ class EnhancedDieselServiceClass {
     }
   }
 
-  // FIXED: updateMachine method in DieselService
+  // Updated updateMachine method with stability checks
   async updateMachine(
     machineName: string,
     updates: Partial<Machine>
@@ -3060,12 +3217,12 @@ class EnhancedDieselServiceClass {
 
       if (
         this.connectionStatus.isConnected &&
-        this.connectionStatus.isInternetReachable
+        this.connectionStatus.isInternetReachable &&
+        this.connectionStatus.connectionStable
       ) {
         try {
           console.log("📡 Attempting immediate machine update...");
 
-          // FIXED: Use POST request with proper data structure
           const response = await this.makeRequest(CONFIG.APPS_SCRIPT_URL, {
             method: "POST",
             body: JSON.stringify({
@@ -3134,11 +3291,15 @@ class EnhancedDieselServiceClass {
       );
       console.log(`📦 Machine update queued with ID: ${queueId}`);
 
+      const connectionMessage = !this.connectionStatus.isInternetReachable
+        ? "Machine updated locally and queued for sync when online."
+        : !this.connectionStatus.isConnected
+        ? "Machine updated locally and will be synced when backend connection is restored."
+        : "Machine updated locally and will be synced when connection stabilizes.";
+
       return {
         success: true,
-        message: this.connectionStatus.isInternetReachable
-          ? "Machine updated locally and will be synced when backend connection is restored."
-          : "Machine updated locally and queued for sync when online.",
+        message: connectionMessage,
         updatedMachine: {
           name: updatedMachine.name,
           plate: updatedMachine.plate,
@@ -3232,7 +3393,8 @@ class EnhancedDieselServiceClass {
 
       if (
         this.connectionStatus.isConnected &&
-        this.connectionStatus.isInternetReachable
+        this.connectionStatus.isInternetReachable &&
+        this.connectionStatus.connectionStable
       ) {
         try {
           console.log("📡 Attempting immediate machine deletion...");
@@ -3298,11 +3460,15 @@ class EnhancedDieselServiceClass {
       );
       console.log(`📦 Machine deletion queued with ID: ${queueId}`);
 
+      const connectionMessage = !this.connectionStatus.isInternetReachable
+        ? "Machine deleted locally and queued for sync when online."
+        : !this.connectionStatus.isConnected
+        ? "Machine deleted locally and will be synced when backend connection is restored."
+        : "Machine deleted locally and will be synced when connection stabilizes.";
+
       return {
         success: true,
-        message: this.connectionStatus.isInternetReachable
-          ? "Machine deleted locally and will be synced when backend connection is restored."
-          : "Machine deleted locally and queued for sync when online.",
+        message: connectionMessage,
         deletedMachine: {
           name: machineToDelete.name,
           plate: machineToDelete.plate,
@@ -3353,8 +3519,11 @@ class EnhancedDieselServiceClass {
   // Image upload
   async uploadImage(imageUri: string, fileName: string): Promise<string> {
     try {
-      if (!this.connectionStatus.isConnected) {
-        console.warn("⚠️ Cannot upload image in demo mode");
+      if (
+        !this.connectionStatus.isConnected ||
+        !this.connectionStatus.connectionStable
+      ) {
+        console.warn("⚠️ Cannot upload image without stable connection");
         return "";
       }
 
@@ -3506,7 +3675,7 @@ class EnhancedDieselServiceClass {
 
   // Cleanup on app close
   destroy(): void {
-    console.log("🧹 Cleaning up DieselService...");
+    console.log("🧹 Cleaning up Enhanced DieselService...");
 
     if (this.syncInterval) {
       clearInterval(this.syncInterval);
@@ -3514,8 +3683,14 @@ class EnhancedDieselServiceClass {
     if (this.connectionCheckInterval) {
       clearInterval(this.connectionCheckInterval);
     }
+    if (this.backendCheckInterval) {
+      clearInterval(this.backendCheckInterval);
+    }
     if (this.realTimeCheckInterval) {
       clearInterval(this.realTimeCheckInterval);
+    }
+    if (this.connectionStabilityTimeout) {
+      clearTimeout(this.connectionStabilityTimeout);
     }
     if (this.netInfoUnsubscribe) {
       this.netInfoUnsubscribe();

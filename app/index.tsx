@@ -1,5 +1,5 @@
-// Enhanced Home Screen with Loading States
-import React, { useState, useEffect } from "react";
+// Enhanced Home Screen with FIXED Connection Status Display
+import React, { useState, useEffect, useCallback } from "react";
 import {
   StyleSheet,
   ScrollView,
@@ -25,6 +25,8 @@ const { width } = Dimensions.get("window");
 interface AlertData {
   overConsumption: any[];
   idleMachines: any[];
+  underWorked?: any[];
+  lowEfficiency?: any[];
 }
 
 interface LoadingState {
@@ -41,6 +43,12 @@ interface DataState {
   alerts: AlertData;
   lastUpdate: string;
   dataSource: "live" | "cached" | "demo";
+  freshness: {
+    machines: { age: number; source: string };
+    inventory: { age: number; source: string };
+    logs: { age: number; source: string };
+    alerts: { age: number; source: string };
+  };
 }
 
 export default function HomeScreen() {
@@ -59,12 +67,23 @@ export default function HomeScreen() {
   const [dataState, setDataState] = useState<DataState>({
     machines: 0,
     inventory: 0,
-    alerts: { overConsumption: [], idleMachines: [] },
+    alerts: {
+      overConsumption: [],
+      idleMachines: [],
+      underWorked: [],
+      lowEfficiency: [],
+    },
     lastUpdate: "",
     dataSource: "demo",
+    freshness: {
+      machines: { age: -1, source: "demo" },
+      inventory: { age: -1, source: "demo" },
+      logs: { age: -1, source: "demo" },
+      alerts: { age: -1, source: "demo" },
+    },
   });
 
-  // Connection status
+  // Connection status with stability tracking
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>({
     isConnected: false,
     isInternetReachable: false,
@@ -72,42 +91,129 @@ export default function HomeScreen() {
     hasRealData: false,
   });
 
-  // Refresh state
+  // UI states
   const [refreshing, setRefreshing] = useState(false);
   const [showLoadingDetails, setShowLoadingDetails] = useState(true);
+  const [lastConnectionChange, setLastConnectionChange] = useState<number>(0);
+  const [stableConnectionStatus, setStableConnectionStatus] =
+    useState<string>("");
+
+  // FIXED: Stable connection status tracking
+  const updateStableConnectionStatus = useCallback(
+    (status: ConnectionStatus) => {
+      const now = Date.now();
+      const statusKey = `${status.isConnected}_${status.isInternetReachable}_${status.hasRealData}`;
+
+      // Only update if enough time has passed since last change (prevent flickering)
+      if (now - lastConnectionChange > 2000) {
+        let newStatus = "";
+
+        if (status.isConnected && status.isInternetReachable) {
+          newStatus = "✅ Live Data";
+        } else if (status.isInternetReachable) {
+          newStatus = "⚠️ Backend Offline";
+        } else {
+          newStatus = "❌ No Internet";
+        }
+
+        if (newStatus !== stableConnectionStatus) {
+          console.log(
+            `📊 Stable status change: ${stableConnectionStatus} → ${newStatus}`
+          );
+          setStableConnectionStatus(newStatus);
+          setLastConnectionChange(now);
+        }
+      }
+    },
+    [lastConnectionChange, stableConnectionStatus]
+  );
+
+  // FIXED: Stable data source determination
+  const determineDataSource = useCallback(
+    (status: ConnectionStatus): "live" | "cached" | "demo" => {
+      if (status.isConnected && status.isInternetReachable) {
+        // Only show as live if we actually have a stable backend connection
+        const enhancedStatus = status as any;
+        if (enhancedStatus.connectionStable !== false) {
+          return "live";
+        }
+      }
+
+      if (status.hasRealData) {
+        return "cached";
+      }
+
+      return "demo";
+    },
+    []
+  );
 
   useEffect(() => {
     initializeApp();
 
-    // Subscribe to connection changes
+    // Subscribe to connection changes with debouncing
     const unsubscribe = DieselService.addConnectionListener((status) => {
-      console.log("🏠 Connection status updated:", status);
+      console.log("🏠 Connection status received:", {
+        isConnected: status.isConnected,
+        isInternetReachable: status.isInternetReachable,
+        hasRealData: status.hasRealData,
+        stable: (status as any).connectionStable,
+      });
+
       setConnectionStatus(status);
+      updateStableConnectionStatus(status);
 
       // Update loading state
       setLoading((prev) => ({ ...prev, connection: false }));
 
-      // If connection restored, refresh data
-      if (status.isConnected && status.isInternetReachable) {
-        loadDashboardData(true);
+      // Determine data source based on stable connection
+      const newDataSource = determineDataSource(status);
+      setDataState((prev) => ({
+        ...prev,
+        dataSource: newDataSource,
+      }));
+
+      // Get data freshness information
+      const freshness = DieselService.getDataFreshness();
+      setDataState((prev) => ({
+        ...prev,
+        freshness,
+      }));
+
+      // If connection is truly stable and we have queue items, show a subtle indicator
+      const enhancedStatus = status as any;
+      if (
+        enhancedStatus.isConnected &&
+        enhancedStatus.isInternetReachable &&
+        enhancedStatus.connectionStable &&
+        !loading.initialLoad
+      ) {
+        const queueStatus = DieselService.getOfflineQueueStatus();
+        if (queueStatus.count > 0) {
+          console.log(
+            `⚡ Stable connection with ${queueStatus.count} items in queue`
+          );
+          // Could show a sync indicator here
+        }
       }
     });
 
     return () => {
       unsubscribe();
     };
-  }, []);
+  }, [updateStableConnectionStatus, determineDataSource, loading.initialLoad]);
 
   const initializeApp = async () => {
     console.log("🚀 Initializing app...");
 
     try {
-      // Show loading screen for minimum 1 second for better UX
+      // Show loading screen for minimum time for better UX
       const startTime = Date.now();
 
       // Get initial connection status
       const initialStatus = DieselService.getConnectionStatus();
       setConnectionStatus(initialStatus);
+      updateStableConnectionStatus(initialStatus);
       setLoading((prev) => ({ ...prev, connection: false }));
 
       // Load dashboard data
@@ -115,16 +221,17 @@ export default function HomeScreen() {
 
       // Ensure minimum loading time
       const loadTime = Date.now() - startTime;
-      if (loadTime < 1000) {
-        await new Promise((resolve) => setTimeout(resolve, 1000 - loadTime));
+      if (loadTime < 1500) {
+        // Slightly increased for stability
+        await new Promise((resolve) => setTimeout(resolve, 1500 - loadTime));
       }
 
       setLoading((prev) => ({ ...prev, initialLoad: false }));
 
-      // Hide loading details after 3 seconds
+      // Hide loading details after delay
       setTimeout(() => {
         setShowLoadingDetails(false);
-      }, 3000);
+      }, 4000); // Increased delay
     } catch (error) {
       console.error("❌ Error initializing app:", error);
       setLoading({
@@ -169,21 +276,30 @@ export default function HomeScreen() {
       // Load alerts
       setLoading((prev) => ({ ...prev, alerts: true }));
       const alertsData = await DieselService.getAlertsData();
+
+      // Get updated data source and freshness
+      const currentStatus = DieselService.getConnectionStatus();
+      const currentDataSource = determineDataSource(currentStatus);
+      const freshness = DieselService.getDataFreshness();
+
       setDataState((prev) => ({
         ...prev,
-        alerts: alertsData.alerts || { overConsumption: [], idleMachines: [] },
+        alerts: alertsData.alerts || {
+          overConsumption: [],
+          idleMachines: [],
+          underWorked: [],
+          lowEfficiency: [],
+        },
         lastUpdate: new Date().toLocaleTimeString(),
-        dataSource: connectionStatus.isConnected
-          ? "live"
-          : connectionStatus.hasRealData
-          ? "cached"
-          : "demo",
+        dataSource: currentDataSource,
+        freshness,
       }));
       setLoading((prev) => ({ ...prev, alerts: false }));
-      console.log(`✅ Loaded alerts data`);
+      console.log(`✅ Loaded alerts data (source: ${currentDataSource})`);
 
       if (isRefresh) {
         // Show success feedback for manual refresh
+        console.log("✨ Dashboard refresh completed");
       }
     } catch (error) {
       console.error("❌ Error loading dashboard data:", error);
@@ -203,14 +319,29 @@ export default function HomeScreen() {
   const handleManualRefresh = async () => {
     console.log("🔄 Manual refresh requested");
 
-    // Force connection check first
-    await DieselService.checkConnection();
+    try {
+      // Force connection check first
+      await DieselService.checkConnection();
 
-    // Then reload data
-    await loadDashboardData(true);
+      // Wait a moment for connection status to stabilize
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+
+      // Then reload data
+      await loadDashboardData(true);
+    } catch (error) {
+      console.error("❌ Manual refresh failed:", error);
+      Alert.alert(
+        "⚠️ Refresh Failed",
+        "Unable to refresh data. Please try again.",
+        [{ text: "OK" }]
+      );
+    }
   };
 
+  // FIXED: Stable connection status colors
   const getConnectionStatusColor = () => {
+    if (loading.connection) return "#6c757d"; // Gray for loading
+
     if (connectionStatus.isConnected && connectionStatus.isInternetReachable) {
       return "#28a745"; // Green - fully connected
     } else if (connectionStatus.isInternetReachable) {
@@ -220,21 +351,18 @@ export default function HomeScreen() {
     }
   };
 
+  // FIXED: Use stable connection status
   const getConnectionStatusText = () => {
     if (loading.connection) return "🔄 Checking...";
-    if (connectionStatus.isConnected && connectionStatus.isInternetReachable) {
-      return "✅ Live Data";
-    } else if (connectionStatus.isInternetReachable) {
-      return "⚠️ Backend Offline";
-    } else {
-      return "❌ No Internet";
-    }
+    return stableConnectionStatus || "❓ Unknown";
   };
 
+  // FIXED: Stable data source text
   const getDataSourceText = () => {
     if (loading.initialLoad) return "🔄 Loading...";
 
-    switch (dataState.dataSource) {
+    const source = dataState.dataSource;
+    switch (source) {
       case "live":
         return "🌐 Live Data";
       case "cached":
@@ -246,10 +374,26 @@ export default function HomeScreen() {
     }
   };
 
+  // FIXED: Helper to get data age display
+  const getDataAge = (ageMs: number): string => {
+    if (ageMs < 0) return "Never";
+
+    const seconds = Math.floor(ageMs / 1000);
+    if (seconds < 60) return `${seconds}s ago`;
+
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes}m ago`;
+
+    const hours = Math.floor(minutes / 60);
+    return `${hours}h ago`;
+  };
+
   const getTotalAlerts = () => {
     return (
       dataState.alerts.overConsumption.length +
-      dataState.alerts.idleMachines.length
+      dataState.alerts.idleMachines.length +
+      (dataState.alerts.underWorked?.length || 0) +
+      (dataState.alerts.lowEfficiency?.length || 0)
     );
   };
 
@@ -381,7 +525,7 @@ export default function HomeScreen() {
     <ThemedView style={styles.container}>
       <StatusBar style={colorScheme === "dark" ? "light" : "dark"} />
 
-      {/* Header with Real-time Status */}
+      {/* Header with Stable Status */}
       <View
         style={[
           styles.header,
@@ -404,7 +548,7 @@ export default function HomeScreen() {
           ✨ Enhanced Machine Management | 📊 Smart Reports
         </ThemedText>
 
-        {/* Real-time Connection Status */}
+        {/* FIXED: Stable Connection Status */}
         <TouchableOpacity
           style={[
             styles.statusIndicator,
@@ -428,7 +572,7 @@ export default function HomeScreen() {
           )}
         </TouchableOpacity>
 
-        {/* Data Source Indicator */}
+        {/* FIXED: Stable Data Source Indicator */}
         <View style={styles.dataSourceIndicator}>
           <Text style={styles.dataSourceText}>{getDataSourceText()}</Text>
           {dataState.lastUpdate && (
@@ -453,7 +597,7 @@ export default function HomeScreen() {
           />
         }
       >
-        {/* Connection Details Card */}
+        {/* FIXED: Enhanced Connection Details Card */}
         <View style={styles.connectionCard}>
           <View style={styles.connectionHeader}>
             <Text style={styles.connectionTitle}>System Status</Text>
@@ -524,14 +668,47 @@ export default function HomeScreen() {
               <Text style={styles.connectionValue}>{getDataSourceText()}</Text>
             </View>
 
+            {/* NEW: Data Freshness Information */}
+            <View style={styles.connectionRow}>
+              <Text style={styles.connectionLabel}>Data Age:</Text>
+              <Text style={[styles.connectionValue, { fontSize: 12 }]}>
+                M:{getDataAge(dataState.freshness.machines.age)} | I:
+                {getDataAge(dataState.freshness.inventory.age)} | A:
+                {getDataAge(dataState.freshness.alerts.age)}
+              </Text>
+            </View>
+
             {connectionStatus.error && (
               <View style={styles.connectionRow}>
                 <Text style={styles.connectionLabel}>Status:</Text>
-                <Text style={[styles.connectionValue, { color: "#dc3545" }]}>
+                <Text
+                  style={[
+                    styles.connectionValue,
+                    { color: "#dc3545", fontSize: 12 },
+                  ]}
+                >
                   {connectionStatus.error}
                 </Text>
               </View>
             )}
+
+            {/* NEW: Queue Status */}
+            {(() => {
+              const queueStatus = DieselService.getOfflineQueueStatus();
+              if (queueStatus.count > 0) {
+                return (
+                  <View style={styles.connectionRow}>
+                    <Text style={styles.connectionLabel}>Queue:</Text>
+                    <Text
+                      style={[styles.connectionValue, { color: "#fd7e14" }]}
+                    >
+                      {queueStatus.count} pending
+                    </Text>
+                  </View>
+                );
+              }
+              return null;
+            })()}
           </View>
         </View>
 
@@ -605,18 +782,21 @@ export default function HomeScreen() {
               🚨 Recent Alerts
             </ThemedText>
 
-            {dataState.alerts.overConsumption.map((alert, index) => (
-              <View
-                key={`over-${index}`}
-                style={[styles.alertItem, { borderLeftColor: "#dc3545" }]}
-              >
-                <Text style={styles.alertText}>
-                  ⚠️ {alert.machine} exceeded fuel limit (+{alert.mismatch}L/hr)
-                </Text>
-              </View>
-            ))}
+            {dataState.alerts.overConsumption
+              .slice(0, 3)
+              .map((alert, index) => (
+                <View
+                  key={`over-${index}`}
+                  style={[styles.alertItem, { borderLeftColor: "#dc3545" }]}
+                >
+                  <Text style={styles.alertText}>
+                    ⚠️ {alert.machine} exceeded fuel limit (+{alert.mismatch}
+                    L/hr)
+                  </Text>
+                </View>
+              ))}
 
-            {dataState.alerts.idleMachines.map((alert, index) => (
+            {dataState.alerts.idleMachines.slice(0, 3).map((alert, index) => (
               <View
                 key={`idle-${index}`}
                 style={[styles.alertItem, { borderLeftColor: "#fd7e14" }]}
@@ -627,21 +807,37 @@ export default function HomeScreen() {
                 </Text>
               </View>
             ))}
+
+            {getTotalAlerts() > 6 && (
+              <TouchableOpacity
+                style={styles.viewAllAlertsButton}
+                onPress={() => handleNavigation("/alerts")}
+              >
+                <Text style={styles.viewAllAlertsText}>
+                  View All {getTotalAlerts()} Alerts →
+                </Text>
+              </TouchableOpacity>
+            )}
           </View>
         )}
 
         {/* Footer Info */}
         <View style={styles.footer}>
           <ThemedText style={styles.footerText}>
-            Version 3.0+ Real-time Edition
+            Version 3.0+ Stable Connection Edition
           </ThemedText>
           <ThemedText style={styles.footerText}>
-            {connectionStatus.isConnected
+            {dataState.dataSource === "live"
               ? "Production Ready"
-              : connectionStatus.hasRealData
+              : dataState.dataSource === "cached"
               ? "Cached Mode"
               : "Demo Mode Active"}
           </ThemedText>
+          {dataState.lastUpdate && (
+            <ThemedText style={styles.footerText}>
+              Last Updated: {dataState.lastUpdate}
+            </ThemedText>
+          )}
         </View>
       </ScrollView>
     </ThemedView>
@@ -998,6 +1194,18 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: "#333",
   },
+  viewAllAlertsButton: {
+    backgroundColor: "#f8f9fa",
+    padding: 12,
+    borderRadius: 8,
+    alignItems: "center",
+    marginTop: 10,
+  },
+  viewAllAlertsText: {
+    fontSize: 14,
+    color: "#007bff",
+    fontWeight: "600",
+  },
   footer: {
     alignItems: "center",
     paddingVertical: 20,
@@ -1007,5 +1215,6 @@ const styles = StyleSheet.create({
     fontSize: 12,
     opacity: 0.6,
     textAlign: "center",
+    marginBottom: 4,
   },
 });

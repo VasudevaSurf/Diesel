@@ -24,6 +24,8 @@ interface InventoryTransaction extends InventoryEntry {
   id: string;
   type: "IN" | "OUT";
   displayAmount: number; // For showing positive/negative amounts
+  machineName?: string; // New field for machine name (OUT transactions only)
+  actualRemarks?: string; // Cleaned remarks field
 }
 
 export default function InventoryScreen() {
@@ -46,6 +48,31 @@ export default function InventoryScreen() {
   useEffect(() => {
     loadInventoryData();
   }, []);
+
+  // Function to extract machine name and clean remarks for OUT transactions
+  const extractMachineInfo = (remarksText: string, type: "IN" | "OUT") => {
+    if (type === "IN") {
+      return {
+        machineName: undefined,
+        actualRemarks: remarksText || "Stock received",
+      };
+    }
+
+    // For OUT transactions, extract machine name from remarks like "Jcb1 - Entry", "Main - Entry"
+    if (remarksText && remarksText.includes(" - Entry")) {
+      const machineName = remarksText.replace(" - Entry", "").trim();
+      return {
+        machineName: machineName,
+        actualRemarks: "Diesel dispensed", // Default remarks for OUT transactions
+      };
+    }
+
+    // Fallback for OUT transactions without the " - Entry" pattern
+    return {
+      machineName: remarksText || "Unknown Machine",
+      actualRemarks: "Diesel dispensed",
+    };
+  };
 
   // Debug function to help identify the correct property names
   const debugTransactionData = (transactions: any[]) => {
@@ -108,7 +135,7 @@ export default function InventoryScreen() {
             transaction.receipt ||
             "";
 
-          const remarks =
+          const rawRemarks =
             transaction.remarks ||
             transaction.Remarks ||
             transaction.description ||
@@ -132,13 +159,21 @@ export default function InventoryScreen() {
             transaction.imageURL ||
             "";
 
+          // Extract machine name and clean remarks
+          const { machineName, actualRemarks } = extractMachineInfo(
+            rawRemarks,
+            type
+          );
+
           console.log("Processing transaction:", {
             originalTransaction: transaction,
             litersAmount,
             displayAmount,
             type,
             receiptNumber,
-            remarks,
+            rawRemarks,
+            machineName,
+            actualRemarks,
             phoneNumber,
           });
 
@@ -149,7 +184,9 @@ export default function InventoryScreen() {
             displayAmount: displayAmount,
             litersReceived: litersAmount,
             receiptNumber: receiptNumber,
-            remarks: remarks,
+            remarks: rawRemarks, // Keep original for compatibility
+            actualRemarks: actualRemarks, // Cleaned remarks
+            machineName: machineName, // Extracted machine name for OUT transactions
             phoneNumber: phoneNumber,
             timestamp: timestamp,
             receiptImage: imageURL,
@@ -170,48 +207,55 @@ export default function InventoryScreen() {
       console.error("Error loading inventory data:", error);
       // Load mock data with both IN and OUT transactions based on your actual data
       setCurrentBalance(475);
-      setTransactions([
+      const mockTransactions = [
         {
           id: "1",
-          type: "IN",
+          type: "IN" as const,
           litersReceived: 107,
           displayAmount: 107,
           receiptNumber: "88999",
           remarks: "Stock received",
+          actualRemarks: "Stock received",
           phoneNumber: "6666666666",
           timestamp: "6/22/2025 22:12:50",
         },
         {
           id: "2",
-          type: "OUT",
+          type: "OUT" as const,
           litersReceived: 2,
           displayAmount: 2,
           receiptNumber: "",
           remarks: "Jcb1 - Entry",
+          actualRemarks: "Diesel dispensed",
+          machineName: "Jcb1",
           phoneNumber: "2323333333",
           timestamp: "6/22/2025 22:15:59",
         },
         {
           id: "3",
-          type: "IN",
+          type: "IN" as const,
           litersReceived: 100,
           displayAmount: 100,
           receiptNumber: "Vcccv",
           remarks: "Stock received",
+          actualRemarks: "Stock received",
           phoneNumber: "5555555555",
           timestamp: "6/22/2025 22:28:02",
         },
         {
           id: "4",
-          type: "OUT",
+          type: "OUT" as const,
           litersReceived: 10,
           displayAmount: 10,
           receiptNumber: "",
           remarks: "Main - Entry",
+          actualRemarks: "Diesel dispensed",
+          machineName: "Main",
           phoneNumber: "2256666666",
           timestamp: "6/22/2025 22:28:27",
         },
-      ]);
+      ];
+      setTransactions(mockTransactions);
     } finally {
       setLoading(false);
     }
@@ -267,7 +311,7 @@ export default function InventoryScreen() {
       const inventoryData: InventoryEntry = {
         litersReceived: parseFloat(litersReceived),
         receiptNumber: receiptNumber.trim(),
-        remarks: remarks.trim(),
+        remarks: remarks.trim() || "Stock received", // Default for IN transactions
         receiptImage: receiptImageUrl,
         phoneNumber: phoneNumber.replace(/\D/g, ""),
         type: "IN", // All manual entries are IN transactions
@@ -438,11 +482,22 @@ export default function InventoryScreen() {
           </View>
         )}
 
-        {item.remarks && (
+        {/* Show machine name for OUT transactions */}
+        {item.type === "OUT" && item.machineName && (
+          <View style={styles.transactionDetailRow}>
+            <IconSymbol name="gear" size={14} color="#666" />
+            <Text style={styles.transactionDetail}>
+              <Text style={styles.bold}>Machine:</Text> {item.machineName}
+            </Text>
+          </View>
+        )}
+
+        {/* Show cleaned remarks */}
+        {item.actualRemarks && (
           <View style={styles.transactionDetailRow}>
             <IconSymbol name="note" size={14} color="#666" />
             <Text style={styles.transactionDetail}>
-              <Text style={styles.bold}>Remarks:</Text> {item.remarks}
+              <Text style={styles.bold}>Remarks:</Text> {item.actualRemarks}
             </Text>
           </View>
         )}
