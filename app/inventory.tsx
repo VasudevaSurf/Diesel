@@ -9,6 +9,7 @@ import {
   Alert,
   Image,
   FlatList,
+  RefreshControl,
 } from "react-native";
 import { StatusBar } from "expo-status-bar";
 import * as ImagePicker from "expo-image-picker";
@@ -22,11 +23,13 @@ import { DieselService, InventoryEntry } from "@/services/DieselService";
 interface InventoryTransaction extends InventoryEntry {
   id: string;
   type: "IN" | "OUT";
+  displayAmount: number; // For showing positive/negative amounts
 }
 
 export default function InventoryScreen() {
   const colorScheme = useColorScheme();
   const [loading, setLoading] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [currentBalance, setCurrentBalance] = useState<number>(0);
   const [transactions, setTransactions] = useState<InventoryTransaction[]>([]);
 
@@ -37,46 +40,187 @@ export default function InventoryScreen() {
   const [remarks, setRemarks] = useState<string>("");
   const [receiptImageUri, setReceiptImageUri] = useState<string>("");
 
+  // Validation state
+  const [hasReceiptImage, setHasReceiptImage] = useState<boolean>(false);
+
   useEffect(() => {
     loadInventoryData();
   }, []);
+
+  // Debug function to help identify the correct property names
+  const debugTransactionData = (transactions: any[]) => {
+    if (transactions && transactions.length > 0) {
+      console.log("Raw transaction data structure:");
+      console.log("First transaction keys:", Object.keys(transactions[0]));
+      console.log("First transaction:", transactions[0]);
+      console.log("Second transaction (if exists):", transactions[1]);
+    }
+  };
 
   const loadInventoryData = async () => {
     try {
       setLoading(true);
       const inventoryData = await DieselService.getInventory();
 
-      setCurrentBalance(inventoryData.currentStock);
+      // Debug the raw data structure
+      console.log("Raw inventory data:", inventoryData);
+      if (inventoryData.transactions) {
+        debugTransactionData(inventoryData.transactions);
+      }
 
-      // Convert transactions to display format
-      const formattedTransactions = inventoryData.transactions.map(
-        (transaction, index) => ({
-          ...transaction,
-          id: `transaction-${index}`,
-          type: "IN" as "IN" | "OUT",
-        })
+      // Set current balance with fallback
+      setCurrentBalance(inventoryData.currentStock || 0);
+
+      // Process transactions to show proper IN/OUT types with amounts
+      const formattedTransactions = (inventoryData.transactions || []).map(
+        (transaction, index) => {
+          // Try different possible property names for the liters amount
+          const litersAmount =
+            transaction.litersReceived ||
+            transaction.liters ||
+            transaction.Liters ||
+            transaction.amount ||
+            transaction.dieselFilled ||
+            0;
+
+          // Get the transaction type
+          const transactionType =
+            transaction.type ||
+            transaction.Type ||
+            transaction["Type (IN/OUT)"] ||
+            (litersAmount < 0 ? "OUT" : "IN");
+
+          // Determine display amount and type
+          let type: "IN" | "OUT" = "IN";
+          let displayAmount = Math.abs(Number(litersAmount)); // Ensure it's a number
+
+          // Handle type determination
+          if (transactionType && typeof transactionType === "string") {
+            type = transactionType.toUpperCase().includes("OUT") ? "OUT" : "IN";
+          } else if (litersAmount < 0) {
+            type = "OUT";
+          }
+
+          // Get other properties with multiple possible names
+          const receiptNumber =
+            transaction.receiptNumber ||
+            transaction["Receipt Number"] ||
+            transaction.receipt ||
+            "";
+
+          const remarks =
+            transaction.remarks ||
+            transaction.Remarks ||
+            transaction.description ||
+            "";
+
+          const phoneNumber =
+            transaction.phoneNumber ||
+            transaction["Phone Number"] ||
+            transaction.phone ||
+            "";
+
+          const timestamp =
+            transaction.timestamp ||
+            transaction.Timestamp ||
+            transaction.date ||
+            new Date().toISOString();
+
+          const imageURL =
+            transaction.receiptImage ||
+            transaction["Image URL"] ||
+            transaction.imageURL ||
+            "";
+
+          console.log("Processing transaction:", {
+            originalTransaction: transaction,
+            litersAmount,
+            displayAmount,
+            type,
+            receiptNumber,
+            remarks,
+            phoneNumber,
+          });
+
+          return {
+            ...transaction,
+            id: transaction.id || `transaction-${index}`,
+            type: type,
+            displayAmount: displayAmount,
+            litersReceived: litersAmount,
+            receiptNumber: receiptNumber,
+            remarks: remarks,
+            phoneNumber: phoneNumber,
+            timestamp: timestamp,
+            receiptImage: imageURL,
+          };
+        }
       );
 
+      // Sort transactions by timestamp (newest first)
+      formattedTransactions.sort((a, b) => {
+        const dateA = new Date(a.timestamp || 0).getTime();
+        const dateB = new Date(b.timestamp || 0).getTime();
+        return dateB - dateA;
+      });
+
+      console.log("Formatted transactions:", formattedTransactions);
       setTransactions(formattedTransactions);
     } catch (error) {
       console.error("Error loading inventory data:", error);
-      // Load mock data
+      // Load mock data with both IN and OUT transactions based on your actual data
       setCurrentBalance(475);
       setTransactions([
         {
           id: "1",
           type: "IN",
-          litersReceived: 500,
-          receiptNumber: "RCP001",
-          remarks: "Initial stock",
-          phoneNumber: "9876543210",
-          timestamp: new Date().toLocaleString(),
+          litersReceived: 107,
+          displayAmount: 107,
+          receiptNumber: "88999",
+          remarks: "Stock received",
+          phoneNumber: "6666666666",
+          timestamp: "6/22/2025 22:12:50",
+        },
+        {
+          id: "2",
+          type: "OUT",
+          litersReceived: 2,
+          displayAmount: 2,
+          receiptNumber: "",
+          remarks: "Jcb1 - Entry",
+          phoneNumber: "2323333333",
+          timestamp: "6/22/2025 22:15:59",
+        },
+        {
+          id: "3",
+          type: "IN",
+          litersReceived: 100,
+          displayAmount: 100,
+          receiptNumber: "Vcccv",
+          remarks: "Stock received",
+          phoneNumber: "5555555555",
+          timestamp: "6/22/2025 22:28:02",
+        },
+        {
+          id: "4",
+          type: "OUT",
+          litersReceived: 10,
+          displayAmount: 10,
+          receiptNumber: "",
+          remarks: "Main - Entry",
+          phoneNumber: "2256666666",
+          timestamp: "6/22/2025 22:28:27",
         },
       ]);
     } finally {
       setLoading(false);
     }
   };
+
+  const onRefresh = React.useCallback(() => {
+    setRefreshing(true);
+    loadInventoryData().finally(() => setRefreshing(false));
+  }, []);
 
   const validateForm = (): boolean => {
     if (phoneNumber.replace(/\D/g, "").length !== 10) {
@@ -86,6 +230,20 @@ export default function InventoryScreen() {
 
     if (!litersReceived || parseFloat(litersReceived) <= 0) {
       Alert.alert("Error", "Please enter valid liters received");
+      return false;
+    }
+
+    // MANDATORY: Receipt image validation
+    if (!receiptImageUri || !hasReceiptImage) {
+      Alert.alert(
+        "Error",
+        "Receipt image is required. Please take or select a photo of the receipt."
+      );
+      return false;
+    }
+
+    if (!receiptNumber.trim()) {
+      Alert.alert("Error", "Receipt number is required");
       return false;
     }
 
@@ -112,6 +270,7 @@ export default function InventoryScreen() {
         remarks: remarks.trim(),
         receiptImage: receiptImageUrl,
         phoneNumber: phoneNumber.replace(/\D/g, ""),
+        type: "IN", // All manual entries are IN transactions
       };
 
       const result = await DieselService.addInventory(inventoryData);
@@ -143,6 +302,7 @@ export default function InventoryScreen() {
     setReceiptNumber("");
     setRemarks("");
     setReceiptImageUri("");
+    setHasReceiptImage(false);
   };
 
   const pickImage = async () => {
@@ -160,11 +320,12 @@ export default function InventoryScreen() {
       mediaTypes: ImagePicker.MediaTypeOptions.Images,
       allowsEditing: true,
       aspect: [4, 3],
-      quality: 0.6,
+      quality: 0.8, // Higher quality for receipt readability
     });
 
     if (!result.canceled && result.assets[0]) {
       setReceiptImageUri(result.assets[0].uri);
+      setHasReceiptImage(true);
     }
   };
 
@@ -182,77 +343,144 @@ export default function InventoryScreen() {
     const result = await ImagePicker.launchCameraAsync({
       allowsEditing: true,
       aspect: [4, 3],
-      quality: 0.6,
+      quality: 0.8, // Higher quality for receipt readability
     });
 
     if (!result.canceled && result.assets[0]) {
       setReceiptImageUri(result.assets[0].uri);
+      setHasReceiptImage(true);
     }
   };
 
   const showImageOptions = () => {
-    Alert.alert("Select Receipt Image", "Choose how to add receipt image", [
-      { text: "Camera", onPress: takePicture },
-      { text: "Gallery", onPress: pickImage },
-      { text: "Cancel", style: "cancel" },
-    ]);
+    Alert.alert(
+      "Receipt Image Required",
+      "Please take or select a photo of the receipt",
+      [
+        { text: "Camera", onPress: takePicture },
+        { text: "Gallery", onPress: pickImage },
+        { text: "Cancel", style: "cancel" },
+      ]
+    );
+  };
+
+  const viewReceiptImage = (transaction: InventoryTransaction) => {
+    if (transaction.receiptImage) {
+      Alert.alert("Receipt Image", "Feature to view full receipt image", [
+        { text: "OK" },
+      ]);
+    }
+  };
+
+  const getTransactionIcon = (type: "IN" | "OUT") => {
+    return type === "IN" ? "plus.circle.fill" : "xmark.circle.fill";
+  };
+
+  const getTransactionColor = (type: "IN" | "OUT") => {
+    return type === "IN" ? "#28a745" : "#dc3545";
+  };
+
+  const formatTransactionAmount = (transaction: InventoryTransaction) => {
+    const sign = transaction.type === "IN" ? "+" : "-";
+    const amount = transaction.displayAmount || 0;
+    return `${sign}${amount.toFixed(1)}L`;
   };
 
   const renderTransaction = ({ item }: { item: InventoryTransaction }) => (
     <View style={styles.transactionItem}>
       <View style={styles.transactionHeader}>
-        <View
-          style={[
-            styles.typeIndicator,
-            {
-              backgroundColor: item.type === "IN" ? "#28a745" : "#dc3545",
-            },
-          ]}
-        >
-          <Text style={styles.typeText}>
-            {item.type === "IN" ? "➕ IN" : "➖ OUT"}
-          </Text>
+        <View style={styles.transactionTypeContainer}>
+          <View
+            style={[
+              styles.typeIndicator,
+              {
+                backgroundColor: getTransactionColor(item.type),
+              },
+            ]}
+          >
+            <IconSymbol
+              name={getTransactionIcon(item.type)}
+              size={16}
+              color="white"
+            />
+            <Text style={styles.typeText}>{item.type}</Text>
+          </View>
+          <View style={styles.transactionAmountContainer}>
+            <Text
+              style={[
+                styles.transactionAmount,
+                { color: getTransactionColor(item.type) },
+              ]}
+            >
+              {formatTransactionAmount(item)}
+            </Text>
+          </View>
         </View>
         <Text style={styles.transactionDate}>{item.timestamp}</Text>
       </View>
 
       <View style={styles.transactionDetails}>
-        <Text style={styles.transactionAmount}>
-          {item.type === "IN" ? "+" : "-"}
-          {item.litersReceived}L
-        </Text>
-
         {item.receiptNumber && (
-          <Text style={styles.transactionDetail}>
-            <Text style={styles.bold}>Receipt:</Text> {item.receiptNumber}
-          </Text>
+          <View style={styles.transactionDetailRow}>
+            <IconSymbol name="doc.text" size={14} color="#666" />
+            <Text style={styles.transactionDetail}>
+              <Text style={styles.bold}>Receipt:</Text> {item.receiptNumber}
+            </Text>
+          </View>
         )}
 
         {item.phoneNumber && (
-          <Text style={styles.transactionDetail}>
-            <Text style={styles.bold}>Phone:</Text> {item.phoneNumber}
-          </Text>
+          <View style={styles.transactionDetailRow}>
+            <IconSymbol name="phone" size={14} color="#666" />
+            <Text style={styles.transactionDetail}>
+              <Text style={styles.bold}>Phone:</Text> {item.phoneNumber}
+            </Text>
+          </View>
         )}
 
         {item.remarks && (
-          <Text style={styles.transactionDetail}>
-            <Text style={styles.bold}>Remarks:</Text> {item.remarks}
-          </Text>
+          <View style={styles.transactionDetailRow}>
+            <IconSymbol name="note" size={14} color="#666" />
+            <Text style={styles.transactionDetail}>
+              <Text style={styles.bold}>Remarks:</Text> {item.remarks}
+            </Text>
+          </View>
         )}
 
         {item.receiptImage && (
-          <TouchableOpacity style={styles.viewReceiptButton}>
+          <TouchableOpacity
+            style={styles.viewReceiptButton}
+            onPress={() => viewReceiptImage(item)}
+          >
             <IconSymbol
-              name="doc.text"
+              name="camera.fill"
               size={16}
               color={Colors[colorScheme ?? "light"].tint}
             />
-            <Text style={styles.viewReceiptText}>View Receipt</Text>
+            <Text style={styles.viewReceiptText}>View Receipt Photo</Text>
           </TouchableOpacity>
         )}
       </View>
     </View>
   );
+
+  // Calculate summary stats
+  const getSummaryStats = () => {
+    const totalIN = transactions
+      .filter((t) => t.type === "IN")
+      .reduce((sum, t) => sum + (t.displayAmount || 0), 0);
+
+    const totalOUT = transactions
+      .filter((t) => t.type === "OUT")
+      .reduce((sum, t) => sum + (t.displayAmount || 0), 0);
+
+    const inCount = transactions.filter((t) => t.type === "IN").length;
+    const outCount = transactions.filter((t) => t.type === "OUT").length;
+
+    return { totalIN, totalOUT, inCount, outCount };
+  };
+
+  const stats = getSummaryStats();
 
   return (
     <ThemedView style={styles.container}>
@@ -270,17 +498,43 @@ export default function InventoryScreen() {
         </ThemedText>
       </View>
 
-      {/* Current Balance Display */}
+      {/* Enhanced Balance Display with Summary */}
       <View style={styles.balanceDisplay}>
-        <Text style={styles.balanceText}>
-          📦 Current Balance: {currentBalance.toFixed(1)}L
-        </Text>
+        <View style={styles.balanceMainInfo}>
+          <Text style={styles.balanceText}>
+            📦 Current Balance: {(currentBalance || 0).toFixed(1)}L
+          </Text>
+        </View>
+
+        <View style={styles.balanceSummary}>
+          <View style={styles.summaryItem}>
+            <Text style={styles.summaryValue}>
+              +{(stats.totalIN || 0).toFixed(1)}L
+            </Text>
+            <Text style={styles.summaryLabel}>{stats.inCount || 0} IN</Text>
+          </View>
+          <View style={styles.summaryDivider} />
+          <View style={styles.summaryItem}>
+            <Text style={styles.summaryValue}>
+              -{(stats.totalOUT || 0).toFixed(1)}L
+            </Text>
+            <Text style={styles.summaryLabel}>{stats.outCount || 0} OUT</Text>
+          </View>
+        </View>
       </View>
 
-      <ScrollView style={styles.content} showsVerticalScrollIndicator={false}>
+      <ScrollView
+        style={styles.content}
+        showsVerticalScrollIndicator={false}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onRefresh} />
+        }
+      >
         {/* Add Stock Form */}
         <View style={styles.section}>
-          <ThemedText style={styles.sectionTitle}>Add Diesel Stock</ThemedText>
+          <ThemedText style={styles.sectionTitle}>
+            Add Diesel Stock (IN)
+          </ThemedText>
 
           {/* Phone Number */}
           <View style={styles.formGroup}>
@@ -316,49 +570,75 @@ export default function InventoryScreen() {
               style={styles.input}
               value={litersReceived}
               onChangeText={setLitersReceived}
-              placeholder="Enter liters of diesel received"
+              placeholder="Enter exact liters of diesel received"
               keyboardType="numeric"
             />
+            <Text style={styles.fieldNote}>
+              📏 Enter the exact amount as shown on delivery receipt
+            </Text>
           </View>
 
           {/* Receipt Number */}
           <View style={styles.formGroup}>
-            <Text style={styles.label}>Receipt Number</Text>
+            <Text style={styles.label}>Receipt/Invoice Number *</Text>
             <TextInput
               style={styles.input}
               value={receiptNumber}
               onChangeText={setReceiptNumber}
-              placeholder="Enter receipt/invoice number"
+              placeholder="Enter receipt or invoice number"
             />
+            <Text style={styles.fieldNote}>
+              📋 This must match the receipt image
+            </Text>
           </View>
 
           {/* Remarks */}
           <View style={styles.formGroup}>
-            <Text style={styles.label}>Remarks (Optional)</Text>
+            <Text style={styles.label}>Supplier/Remarks</Text>
             <TextInput
               style={[styles.input, styles.textArea]}
               value={remarks}
               onChangeText={setRemarks}
-              placeholder="Add any notes about this stock entry"
+              placeholder="Supplier name, delivery details, etc."
               multiline
               numberOfLines={3}
             />
           </View>
 
-          {/* Receipt Image */}
+          {/* MANDATORY Receipt Image */}
           <View style={styles.formGroup}>
-            <Text style={styles.label}>Receipt Image (Optional)</Text>
+            <Text style={styles.label}>
+              Receipt Image *{" "}
+              <Text style={styles.requiredText}>(Required)</Text>
+            </Text>
             <TouchableOpacity
-              style={styles.imageButton}
+              style={[
+                styles.imageButton,
+                !hasReceiptImage && styles.imageButtonRequired,
+                hasReceiptImage && styles.imageButtonSuccess,
+              ]}
               onPress={showImageOptions}
             >
               <IconSymbol
                 name="camera.fill"
                 size={24}
-                color={Colors[colorScheme ?? "light"].tint}
+                color={hasReceiptImage ? "#28a745" : "#dc3545"}
               />
-              <Text style={styles.imageButtonText}>Add Receipt Image</Text>
+              <Text
+                style={[
+                  styles.imageButtonText,
+                  { color: hasReceiptImage ? "#28a745" : "#dc3545" },
+                ]}
+              >
+                {hasReceiptImage
+                  ? "Receipt Photo Added ✅"
+                  : "Add Receipt Photo (Required)"}
+              </Text>
             </TouchableOpacity>
+
+            <Text style={styles.imageNote}>
+              📷 Clear photo of receipt showing amount and receipt number
+            </Text>
 
             {receiptImageUri ? (
               <View style={styles.imageContainer}>
@@ -368,7 +648,10 @@ export default function InventoryScreen() {
                 />
                 <TouchableOpacity
                   style={styles.removeImageButton}
-                  onPress={() => setReceiptImageUri("")}
+                  onPress={() => {
+                    setReceiptImageUri("");
+                    setHasReceiptImage(false);
+                  }}
                 >
                   <IconSymbol
                     name="xmark.circle.fill"
@@ -376,6 +659,13 @@ export default function InventoryScreen() {
                     color="#dc3545"
                   />
                 </TouchableOpacity>
+                <View style={styles.imageSuccessOverlay}>
+                  <IconSymbol
+                    name="checkmark.circle"
+                    size={32}
+                    color="#28a745"
+                  />
+                </View>
               </View>
             ) : null}
           </View>
@@ -385,27 +675,43 @@ export default function InventoryScreen() {
             style={[
               styles.submitButton,
               {
-                backgroundColor: Colors[colorScheme ?? "light"].tint,
+                backgroundColor: hasReceiptImage
+                  ? Colors[colorScheme ?? "light"].tint
+                  : "#6c757d",
                 opacity: loading ? 0.7 : 1,
               },
             ]}
             onPress={handleSubmit}
-            disabled={loading}
+            disabled={loading || !hasReceiptImage}
           >
             <Text style={styles.submitButtonText}>
-              {loading ? "Adding to Inventory..." : "Add to Inventory"}
+              {loading
+                ? "Adding to Inventory..."
+                : !hasReceiptImage
+                ? "Receipt Photo Required"
+                : "Add to Inventory"}
             </Text>
           </TouchableOpacity>
         </View>
 
-        {/* Inventory History */}
+        {/* Enhanced Inventory History */}
         <View style={styles.section}>
-          <ThemedText style={styles.sectionTitle}>Inventory History</ThemedText>
+          <View style={styles.historyHeader}>
+            <ThemedText style={styles.sectionTitle}>
+              Inventory History
+            </ThemedText>
+            <Text style={styles.historyCount}>
+              {transactions.length || 0} transactions
+            </Text>
+          </View>
 
           {transactions.length === 0 ? (
             <View style={styles.emptyContainer}>
               <IconSymbol name="tray" size={48} color="#ccc" />
               <Text style={styles.emptyText}>No inventory records found</Text>
+              <Text style={styles.emptySubtext}>
+                Add your first stock entry above
+              </Text>
             </View>
           ) : (
             <FlatList
@@ -441,12 +747,39 @@ const styles = StyleSheet.create({
     backgroundColor: "#9C27B0",
     paddingHorizontal: 20,
     paddingVertical: 15,
+  },
+  balanceMainInfo: {
     alignItems: "center",
+    marginBottom: 10,
   },
   balanceText: {
     color: "white",
     fontSize: 20,
     fontWeight: "600",
+  },
+  balanceSummary: {
+    flexDirection: "row",
+    justifyContent: "center",
+    alignItems: "center",
+    gap: 20,
+  },
+  summaryItem: {
+    alignItems: "center",
+  },
+  summaryValue: {
+    color: "white",
+    fontSize: 16,
+    fontWeight: "bold",
+  },
+  summaryLabel: {
+    color: "rgba(255, 255, 255, 0.8)",
+    fontSize: 12,
+    marginTop: 2,
+  },
+  summaryDivider: {
+    width: 1,
+    height: 30,
+    backgroundColor: "rgba(255, 255, 255, 0.3)",
   },
   content: {
     flex: 1,
@@ -461,6 +794,17 @@ const styles = StyleSheet.create({
     fontWeight: "bold",
     marginBottom: 20,
   },
+  historyHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 20,
+  },
+  historyCount: {
+    fontSize: 14,
+    color: "#666",
+    fontStyle: "italic",
+  },
   formGroup: {
     marginBottom: 20,
   },
@@ -469,6 +813,11 @@ const styles = StyleSheet.create({
     fontWeight: "600",
     marginBottom: 8,
     color: "#333",
+  },
+  requiredText: {
+    color: "#dc3545",
+    fontSize: 14,
+    fontWeight: "bold",
   },
   input: {
     borderWidth: 2,
@@ -481,6 +830,19 @@ const styles = StyleSheet.create({
   textArea: {
     height: 80,
     textAlignVertical: "top",
+  },
+  fieldNote: {
+    fontSize: 12,
+    color: "#666",
+    marginTop: 5,
+    fontStyle: "italic",
+  },
+  imageNote: {
+    fontSize: 12,
+    color: "#666",
+    marginTop: 5,
+    marginBottom: 10,
+    fontStyle: "italic",
   },
   validationText: {
     fontSize: 12,
@@ -496,6 +858,14 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     padding: 15,
     gap: 10,
+  },
+  imageButtonRequired: {
+    borderColor: "#dc3545",
+    backgroundColor: "#fff5f5",
+  },
+  imageButtonSuccess: {
+    borderColor: "#28a745",
+    backgroundColor: "#f0fff4",
   },
   imageButtonText: {
     fontSize: 16,
@@ -516,6 +886,14 @@ const styles = StyleSheet.create({
     right: 10,
     backgroundColor: "white",
     borderRadius: 12,
+  },
+  imageSuccessOverlay: {
+    position: "absolute",
+    bottom: 10,
+    right: 10,
+    backgroundColor: "rgba(255, 255, 255, 0.9)",
+    borderRadius: 16,
+    padding: 4,
   },
   submitButton: {
     padding: 15,
@@ -543,35 +921,51 @@ const styles = StyleSheet.create({
   transactionHeader: {
     flexDirection: "row",
     justifyContent: "space-between",
+    alignItems: "flex-start",
+    marginBottom: 12,
+  },
+  transactionTypeContainer: {
+    flexDirection: "row",
     alignItems: "center",
-    marginBottom: 10,
+    gap: 12,
   },
   typeIndicator: {
-    paddingHorizontal: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 10,
     paddingVertical: 6,
-    borderRadius: 20,
+    borderRadius: 16,
+    gap: 4,
   },
   typeText: {
     color: "white",
     fontSize: 12,
     fontWeight: "bold",
   },
-  transactionDate: {
-    fontSize: 12,
-    color: "#666",
-  },
-  transactionDetails: {
-    gap: 5,
+  transactionAmountContainer: {
+    alignItems: "center",
   },
   transactionAmount: {
     fontSize: 18,
     fontWeight: "bold",
-    color: "#333",
-    marginBottom: 5,
+  },
+  transactionDate: {
+    fontSize: 12,
+    color: "#666",
+    textAlign: "right",
+  },
+  transactionDetails: {
+    gap: 8,
+  },
+  transactionDetailRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
   },
   transactionDetail: {
     fontSize: 14,
     color: "#666",
+    flex: 1,
   },
   bold: {
     fontWeight: "bold",
@@ -580,8 +974,13 @@ const styles = StyleSheet.create({
   viewReceiptButton: {
     flexDirection: "row",
     alignItems: "center",
-    marginTop: 5,
-    gap: 5,
+    marginTop: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    backgroundColor: "#f8f9fa",
+    borderRadius: 6,
+    alignSelf: "flex-start",
+    gap: 6,
   },
   viewReceiptText: {
     fontSize: 14,
@@ -596,5 +995,11 @@ const styles = StyleSheet.create({
     fontSize: 16,
     color: "#666",
     marginTop: 10,
+    fontWeight: "600",
+  },
+  emptySubtext: {
+    fontSize: 14,
+    color: "#999",
+    marginTop: 5,
   },
 });
