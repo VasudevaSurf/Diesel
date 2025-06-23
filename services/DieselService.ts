@@ -1,11 +1,12 @@
+// Enhanced DieselService.ts - Fixed Warning Submission and Mismatch Data
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import * as Network from "expo-network";
 import NetInfo from "@react-native-community/netinfo";
+import * as Network from "expo-network";
 
 // Configuration
 const CONFIG = {
   APPS_SCRIPT_URL:
-    "https://script.google.com/macros/s/AKfycbxtBrJY5SPUFtZv5cXu65SUSy7wyAIVHx6zYEtGG7pWu82JwrRegUWvw8LGBeSAo7DY/exec",
+    "https://script.google.com/macros/s/AKfycbxXBRh7D7kZMrFbZfANGg_BXYJp2ibDRdM_YOCRgr9Nt39Fvn6HPvFK1MbmASG6zjSs/exec",
   ADMIN_PASSWORD: "admin123",
   INVENTORY_PASSWORD: "inventory456",
   TIMEOUT: 10000, // 10 seconds
@@ -30,6 +31,8 @@ const STORAGE_KEYS = {
   PENDING_MACHINES: "@diesel_tracker:pending_machines",
   CACHED_DATA_TIMESTAMP: "@diesel_tracker:cached_data_timestamp",
   HAS_REAL_DATA: "@diesel_tracker:has_real_data",
+  ALERTS: "@diesel_tracker:alerts",
+  MISMATCH_DATA: "@diesel_tracker:mismatch_data", // NEW: For mismatch calculations
 };
 
 const DEBUG_MODE = __DEV__;
@@ -94,6 +97,13 @@ export interface DieselEntry {
   expectedDaily?: number;
   createdAt?: string;
   updatedAt?: string;
+  // NEW: Dispenser readings
+  dispenserStartReading?: number;
+  dispenserEndReading?: number;
+  // NEW: Warning flags
+  hasWarnings?: boolean;
+  warningTypes?: string[];
+  warningMessages?: string[];
 }
 
 export interface InventoryEntry {
@@ -128,24 +138,82 @@ export interface QueuedItem {
 export interface AlertData {
   overConsumption: OverConsumptionAlert[];
   idleMachines: IdleMachineAlert[];
+  underWorked?: UnderWorkedAlert[];
+  lowEfficiency?: LowEfficiencyAlert[];
 }
 
 export interface OverConsumptionAlert {
   machine: string;
+  plate?: string;
   standardAvg: number;
   actualAvg: number;
   mismatch: number;
   timestamp: string;
-  severity: "low" | "medium" | "high";
+  severity: "low" | "medium" | "high" | "critical";
+  machineType: string;
+  ownershipType: string;
+  unit: string;
+  description: string;
 }
 
 export interface IdleMachineAlert {
   machine: string;
+  plate?: string;
   expectedHours: number;
   actualHours: number;
   mismatch: number;
   timestamp: string;
-  severity: "low" | "medium" | "high";
+  severity: "low" | "medium" | "high" | "critical";
+  machineType: string;
+  ownershipType: string;
+  unit: string;
+  description: string;
+}
+
+// NEW: Additional alert types
+export interface UnderWorkedAlert {
+  machine: string;
+  plate?: string;
+  expectedHours: number;
+  actualHours: number;
+  mismatch: number;
+  timestamp: string;
+  severity: "low" | "medium" | "high" | "critical";
+  machineType: string;
+  ownershipType: string;
+  unit: string;
+  description: string;
+}
+
+export interface LowEfficiencyAlert {
+  machine: string;
+  plate?: string;
+  standardAvg: number;
+  actualAvg: number;
+  mismatch: number;
+  timestamp: string;
+  severity: "low" | "medium" | "high" | "critical";
+  machineType: string;
+  ownershipType: string;
+  unit: string;
+  description: string;
+}
+
+// NEW: Mismatch data structure
+export interface MismatchData {
+  id: string;
+  machineName: string;
+  plate: string;
+  machineType: string;
+  timestamp: string;
+  consumptionMismatch: number; // Actual rate - Standard rate
+  hoursMismatch: number; // Actual hours - Expected hours
+  standardConsumption: number;
+  actualConsumption: number;
+  standardHours: number;
+  actualHours: number;
+  severity: "low" | "medium" | "high" | "critical";
+  warningTypes: string[];
 }
 
 export interface ApiResponse<T = any> {
@@ -163,6 +231,11 @@ export interface ApiResponse<T = any> {
   hasLogs?: boolean;
   requiresConfirmation?: boolean;
   deletedMachine?: any;
+  // NEW: Warning-related fields
+  hasWarnings?: boolean;
+  warningMessages?: string[];
+  warningTypes?: string[];
+  allowSubmitWithWarnings?: boolean;
 }
 
 export interface ConnectionStatus {
@@ -218,6 +291,10 @@ export interface AlertItem {
   status: "active" | "resolved" | "acknowledged";
   expectedHours?: number;
   actualHours?: number;
+  // NEW: Enhanced mismatch display
+  consumptionMismatch?: number;
+  hoursMismatch?: number;
+  mismatchDisplay?: string;
 }
 
 export interface MachinePerformanceAnalytics {
@@ -795,107 +872,6 @@ class EnhancedDieselServiceClass {
       },
     };
   }
-  async loadAllData(forceRefresh: boolean = false): Promise<{
-    machines: Machine[];
-    inventory: { currentStock: number; transactions: InventoryEntry[] };
-    logs: DieselEntry[];
-    alerts: AlertData;
-    loadingResults: { [key: string]: { success: boolean; message: string } };
-  }> {
-    this.setLoadingState(true, "loadAllData", "Loading all dashboard data...");
-
-    const results = {
-      machines: [] as Machine[],
-      inventory: { currentStock: 0, transactions: [] as InventoryEntry[] },
-      logs: [] as DieselEntry[],
-      alerts: { overConsumption: [], idleMachines: [] } as AlertData,
-      loadingResults: {} as {
-        [key: string]: { success: boolean; message: string };
-      },
-    };
-
-    try {
-      // Load machines
-      this.setLoadingState(true, "loadAllData", "Loading machines...", 25);
-      try {
-        results.machines = await this.getMachines();
-        results.loadingResults.machines = {
-          success: true,
-          message: `Loaded ${results.machines.length} machines`,
-        };
-      } catch (error) {
-        results.loadingResults.machines = {
-          success: false,
-          message: `Failed to load machines: ${error}`,
-        };
-      }
-
-      // Load inventory
-      this.setLoadingState(true, "loadAllData", "Loading inventory...", 50);
-      try {
-        results.inventory = await this.getInventory();
-        results.loadingResults.inventory = {
-          success: true,
-          message: `Loaded inventory: ${results.inventory.currentStock.toFixed(
-            1
-          )}L`,
-        };
-      } catch (error) {
-        results.loadingResults.inventory = {
-          success: false,
-          message: `Failed to load inventory: ${error}`,
-        };
-      }
-
-      // Load logs
-      this.setLoadingState(true, "loadAllData", "Loading logs...", 75);
-      try {
-        const logsResult = await this.getLogs();
-        results.logs = logsResult.logs;
-        results.loadingResults.logs = {
-          success: logsResult.success,
-          message: `Loaded ${results.logs.length} logs`,
-        };
-      } catch (error) {
-        results.loadingResults.logs = {
-          success: false,
-          message: `Failed to load logs: ${error}`,
-        };
-      }
-
-      // Load alerts
-      this.setLoadingState(true, "loadAllData", "Loading alerts...", 90);
-      try {
-        const alertsResult = await this.getAlertsData();
-        results.alerts = alertsResult.alerts;
-        const totalAlerts =
-          (results.alerts.overConsumption?.length || 0) +
-          (results.alerts.idleMachines?.length || 0);
-        results.loadingResults.alerts = {
-          success: alertsResult.success,
-          message: `Loaded ${totalAlerts} alerts`,
-        };
-      } catch (error) {
-        results.loadingResults.alerts = {
-          success: false,
-          message: `Failed to load alerts: ${error}`,
-        };
-      }
-
-      this.setLoadingState(
-        false,
-        "loadAllData",
-        "All data loaded successfully"
-      );
-      console.log("✅ Batch data loading completed", results.loadingResults);
-
-      return results;
-    } catch (error) {
-      console.error("❌ Error in batch data loading:", error);
-      this.setLoadingState(false, "loadAllData", "Batch loading failed");
-      throw error;
-    }
-  }
 
   private async checkBackendConnection(): Promise<boolean> {
     const startTime = Date.now();
@@ -1374,6 +1350,200 @@ class EnhancedDieselServiceClass {
     }
   }
 
+  // NEW: Get mismatch data with enhanced calculations
+  async getMismatchData(): Promise<{
+    mismatchData: MismatchData[];
+    success: boolean;
+  }> {
+    this.setLoadingState(true, "mismatchData", "Loading mismatch data...");
+
+    try {
+      console.log("📊 Getting mismatch data...");
+
+      if (
+        !this.connectionStatus.isConnected ||
+        !this.connectionStatus.isInternetReachable
+      ) {
+        console.log("📱 Using cached/offline mismatch data");
+        const cached = await this.getCachedData<MismatchData[]>(
+          STORAGE_KEYS.MISMATCH_DATA
+        );
+
+        if (cached && cached.length > 0) {
+          console.log(`✅ Returning ${cached.length} cached mismatch records`);
+          this.setLoadingState(
+            false,
+            "mismatchData",
+            `Loaded ${cached.length} mismatch records from cache`
+          );
+          return { mismatchData: cached, success: true };
+        } else {
+          console.log("🎭 No cached mismatch data, calculating from logs...");
+          const calculatedMismatch = await this.calculateMismatchFromLocal();
+          this.setLoadingState(
+            false,
+            "mismatchData",
+            `Calculated ${calculatedMismatch.length} mismatch records`
+          );
+          return { mismatchData: calculatedMismatch, success: true };
+        }
+      }
+
+      console.log("📡 Fetching mismatch data from backend...");
+      const response = await this.makeRequest<{ mismatchData: MismatchData[] }>(
+        `${
+          CONFIG.APPS_SCRIPT_URL
+        }?action=getMismatchData&timestamp=${Date.now()}`
+      );
+
+      if (response.success && response.data) {
+        const mismatchData = response.data.mismatchData || [];
+        console.log(
+          `✅ Fetched ${mismatchData.length} mismatch records from backend`
+        );
+
+        // Cache the data
+        await this.cacheData(STORAGE_KEYS.MISMATCH_DATA, mismatchData);
+
+        this.setLoadingState(
+          false,
+          "mismatchData",
+          `Loaded ${mismatchData.length} mismatch records from server`
+        );
+        return { mismatchData, success: true };
+      } else {
+        throw new Error(response.message || "Failed to fetch mismatch data");
+      }
+    } catch (error) {
+      console.error("❌ Error fetching mismatch data:", error);
+
+      // Fallback to local calculation
+      const calculatedMismatch = await this.calculateMismatchFromLocal();
+      this.setLoadingState(
+        false,
+        "mismatchData",
+        `Calculated ${calculatedMismatch.length} mismatch records (offline)`
+      );
+      return { mismatchData: calculatedMismatch, success: false };
+    }
+  }
+
+  // NEW: Calculate mismatch data from local logs and machines
+  private async calculateMismatchFromLocal(): Promise<MismatchData[]> {
+    try {
+      const [machines, logsResult] = await Promise.all([
+        this.getMachines(),
+        this.getLogs(),
+      ]);
+
+      const mismatchData: MismatchData[] = [];
+
+      for (const log of logsResult.logs) {
+        const machine = machines.find((m) => m.name === log.machineName);
+        if (!machine) continue;
+
+        const consumptionMismatch =
+          (log.rate || 0) - (machine.standardAvgDiesel || 0);
+        const hoursMismatch =
+          (log.usage || 0) - (machine.expectedDailyHours || 0);
+
+        // Calculate severity based on mismatch values
+        const severity = this.calculateMismatchSeverity(
+          consumptionMismatch,
+          hoursMismatch,
+          machine.machineType
+        );
+
+        // Determine warning types
+        const warningTypes: string[] = [];
+        if (
+          Math.abs(consumptionMismatch) >
+          (machine.standardAvgDiesel || 0) * 0.1
+        ) {
+          warningTypes.push(
+            machine.machineType === "KM/l"
+              ? "LOW_EFFICIENCY"
+              : "OVER_CONSUMPTION"
+          );
+        }
+        if (Math.abs(hoursMismatch) > (machine.expectedDailyHours || 0) * 0.2) {
+          warningTypes.push(hoursMismatch < 0 ? "IDLE_MACHINE" : "OVER_WORKED");
+        }
+
+        mismatchData.push({
+          id: `mismatch_${log.id || Date.now()}_${Math.random()
+            .toString(36)
+            .substr(2, 9)}`,
+          machineName: log.machineName,
+          plate: machine.plate || "",
+          machineType: machine.machineType || "L/hr",
+          timestamp: log.timestamp || new Date().toISOString(),
+          consumptionMismatch,
+          hoursMismatch,
+          standardConsumption: machine.standardAvgDiesel || 0,
+          actualConsumption: log.rate || 0,
+          standardHours: machine.expectedDailyHours || 0,
+          actualHours: log.usage || 0,
+          severity,
+          warningTypes,
+        });
+      }
+
+      // Cache the calculated data
+      await this.cacheData(STORAGE_KEYS.MISMATCH_DATA, mismatchData);
+
+      return mismatchData;
+    } catch (error) {
+      console.error("❌ Error calculating mismatch data:", error);
+      return [];
+    }
+  }
+
+  // NEW: Calculate mismatch severity
+  private calculateMismatchSeverity(
+    consumptionMismatch: number,
+    hoursMismatch: number,
+    machineType?: string
+  ): "low" | "medium" | "high" | "critical" {
+    const absConsumption = Math.abs(consumptionMismatch);
+    const absHours = Math.abs(hoursMismatch);
+
+    // For consumption mismatch
+    let consumptionSeverity = 0;
+    if (machineType === "KM/l") {
+      if (absConsumption > 2) consumptionSeverity = 4;
+      else if (absConsumption > 1) consumptionSeverity = 3;
+      else if (absConsumption > 0.5) consumptionSeverity = 2;
+      else consumptionSeverity = 1;
+    } else {
+      if (absConsumption > 2.5) consumptionSeverity = 4;
+      else if (absConsumption > 1.5) consumptionSeverity = 3;
+      else if (absConsumption > 0.5) consumptionSeverity = 2;
+      else consumptionSeverity = 1;
+    }
+
+    // For hours mismatch
+    let hoursSeverity = 0;
+    if (absHours > 5) hoursSeverity = 4;
+    else if (absHours > 3) hoursSeverity = 3;
+    else if (absHours > 1) hoursSeverity = 2;
+    else hoursSeverity = 1;
+
+    // Take the higher severity
+    const maxSeverity = Math.max(consumptionSeverity, hoursSeverity);
+
+    switch (maxSeverity) {
+      case 4:
+        return "critical";
+      case 3:
+        return "high";
+      case 2:
+        return "medium";
+      default:
+        return "low";
+    }
+  }
+
   async getAlertsData(): Promise<{ alerts: AlertData; success: boolean }> {
     this.setLoadingState(true, "alerts", "Loading alerts data...");
 
@@ -1389,9 +1559,7 @@ class EnhancedDieselServiceClass {
         console.log("📱 Using cached/offline alerts data");
         this.setLoadingState(true, "alerts", "Loading from cache...", 50);
 
-        const cached = await this.getCachedData<AlertData>(
-          "@diesel_tracker:alerts"
-        );
+        const cached = await this.getCachedData<AlertData>(STORAGE_KEYS.ALERTS);
 
         if (cached) {
           console.log(`✅ Returning cached alerts`);
@@ -1399,7 +1567,9 @@ class EnhancedDieselServiceClass {
             new Date().toISOString();
           const totalAlerts =
             (cached.overConsumption?.length || 0) +
-            (cached.idleMachines?.length || 0);
+            (cached.idleMachines?.length || 0) +
+            (cached.underWorked?.length || 0) +
+            (cached.lowEfficiency?.length || 0);
           this.setLoadingState(
             false,
             "alerts",
@@ -1410,16 +1580,21 @@ class EnhancedDieselServiceClass {
           console.log("⚠️ No cached alerts but should have real data");
           this.setLoadingState(false, "alerts", "No cached data available");
           return {
-            alerts: { overConsumption: [], idleMachines: [] },
+            alerts: {
+              overConsumption: [],
+              idleMachines: [],
+              underWorked: [],
+              lowEfficiency: [],
+            },
             success: true,
           };
         } else {
-          console.log("🎭 No cached data, returning demo alerts");
-          this.setLoadingState(false, "alerts", "Loaded demo alerts");
-          return {
-            alerts: { overConsumption: [], idleMachines: [] },
-            success: true,
-          };
+          console.log(
+            "🎭 No cached data, generating demo alerts from mismatch data"
+          );
+          const demoAlerts = await this.generateAlertsFromMismatch();
+          this.setLoadingState(false, "alerts", "Generated demo alerts");
+          return { alerts: demoAlerts, success: true };
         }
       }
 
@@ -1436,10 +1611,12 @@ class EnhancedDieselServiceClass {
         const alertsData = response.alerts || {
           overConsumption: [],
           idleMachines: [],
+          underWorked: [],
+          lowEfficiency: [],
         };
 
         // Cache the data
-        await this.cacheData("@diesel_tracker:alerts", alertsData);
+        await this.cacheData(STORAGE_KEYS.ALERTS, alertsData);
 
         // Mark that we have real data
         this.connectionStatus.hasRealData = true;
@@ -1452,7 +1629,9 @@ class EnhancedDieselServiceClass {
 
         const totalAlerts =
           (alertsData.overConsumption?.length || 0) +
-          (alertsData.idleMachines?.length || 0);
+          (alertsData.idleMachines?.length || 0) +
+          (alertsData.underWorked?.length || 0) +
+          (alertsData.lowEfficiency?.length || 0);
         this.setLoadingState(
           false,
           "alerts",
@@ -1472,13 +1651,13 @@ class EnhancedDieselServiceClass {
       );
 
       // Return cached data
-      const cached = await this.getCachedData<AlertData>(
-        "@diesel_tracker:alerts"
-      );
+      const cached = await this.getCachedData<AlertData>(STORAGE_KEYS.ALERTS);
       if (cached) {
         const totalAlerts =
           (cached.overConsumption?.length || 0) +
-          (cached.idleMachines?.length || 0);
+          (cached.idleMachines?.length || 0) +
+          (cached.underWorked?.length || 0) +
+          (cached.lowEfficiency?.length || 0);
         this.setLoadingState(
           false,
           "alerts",
@@ -1487,10 +1666,118 @@ class EnhancedDieselServiceClass {
         return { alerts: cached, success: false };
       }
 
-      this.setLoadingState(false, "alerts", "No data available");
+      // Generate alerts from mismatch data as fallback
+      const fallbackAlerts = await this.generateAlertsFromMismatch();
+      this.setLoadingState(false, "alerts", "Generated fallback alerts");
+      return { alerts: fallbackAlerts, success: false };
+    }
+  }
+
+  // NEW: Generate alerts from mismatch data
+  private async generateAlertsFromMismatch(): Promise<AlertData> {
+    try {
+      const mismatchResult = await this.getMismatchData();
+      const machines = await this.getMachines();
+
+      const alerts: AlertData = {
+        overConsumption: [],
+        idleMachines: [],
+        underWorked: [],
+        lowEfficiency: [],
+      };
+
+      for (const mismatch of mismatchResult.mismatchData) {
+        const machine = machines.find((m) => m.name === mismatch.machineName);
+        if (!machine) continue;
+
+        // Over consumption / Low efficiency alerts
+        if (mismatch.warningTypes.includes("OVER_CONSUMPTION")) {
+          alerts.overConsumption.push({
+            machine: mismatch.machineName,
+            plate: mismatch.plate,
+            standardAvg: mismatch.standardConsumption,
+            actualAvg: mismatch.actualConsumption,
+            mismatch: mismatch.consumptionMismatch,
+            timestamp: mismatch.timestamp,
+            severity: mismatch.severity,
+            machineType: mismatch.machineType,
+            ownershipType: machine.ownershipType || "Own",
+            unit: mismatch.machineType === "KM/l" ? "KM/l" : "L/hr",
+            description: `Over consumption: ${Math.abs(
+              mismatch.consumptionMismatch
+            ).toFixed(2)} ${
+              mismatch.machineType === "KM/l" ? "KM/l" : "L/hr"
+            } above standard`,
+          });
+        }
+
+        if (mismatch.warningTypes.includes("LOW_EFFICIENCY")) {
+          alerts.lowEfficiency.push({
+            machine: mismatch.machineName,
+            plate: mismatch.plate,
+            standardAvg: mismatch.standardConsumption,
+            actualAvg: mismatch.actualConsumption,
+            mismatch: mismatch.consumptionMismatch,
+            timestamp: mismatch.timestamp,
+            severity: mismatch.severity,
+            machineType: mismatch.machineType,
+            ownershipType: machine.ownershipType || "Own",
+            unit: mismatch.machineType === "KM/l" ? "KM/l" : "L/hr",
+            description: `Low efficiency: ${Math.abs(
+              mismatch.consumptionMismatch
+            ).toFixed(2)} ${
+              mismatch.machineType === "KM/l" ? "KM/l" : "L/hr"
+            } below standard`,
+          });
+        }
+
+        // Idle machine alerts
+        if (mismatch.warningTypes.includes("IDLE_MACHINE")) {
+          alerts.idleMachines.push({
+            machine: mismatch.machineName,
+            plate: mismatch.plate,
+            expectedHours: mismatch.standardHours,
+            actualHours: mismatch.actualHours,
+            mismatch: mismatch.hoursMismatch,
+            timestamp: mismatch.timestamp,
+            severity: mismatch.severity,
+            machineType: mismatch.machineType,
+            ownershipType: machine.ownershipType || "Own",
+            unit: "hours",
+            description: `Machine idle: ${Math.abs(
+              mismatch.hoursMismatch
+            ).toFixed(1)} hours below expected`,
+          });
+        }
+
+        // Under worked alerts
+        if (mismatch.warningTypes.includes("OVER_WORKED")) {
+          alerts.underWorked?.push({
+            machine: mismatch.machineName,
+            plate: mismatch.plate,
+            expectedHours: mismatch.standardHours,
+            actualHours: mismatch.actualHours,
+            mismatch: mismatch.hoursMismatch,
+            timestamp: mismatch.timestamp,
+            severity: mismatch.severity,
+            machineType: mismatch.machineType,
+            ownershipType: machine.ownershipType || "Own",
+            unit: "hours",
+            description: `Machine over-worked: ${Math.abs(
+              mismatch.hoursMismatch
+            ).toFixed(1)} hours above expected`,
+          });
+        }
+      }
+
+      return alerts;
+    } catch (error) {
+      console.error("❌ Error generating alerts from mismatch:", error);
       return {
-        alerts: { overConsumption: [], idleMachines: [] },
-        success: false,
+        overConsumption: [],
+        idleMachines: [],
+        underWorked: [],
+        lowEfficiency: [],
       };
     }
   }
@@ -1954,7 +2241,7 @@ class EnhancedDieselServiceClass {
     }
   }
 
-  // Enhanced submission methods with immediate local updates and queue management
+  // FIXED: Enhanced submission methods with proper warning handling
   async submitEntry(entry: DieselEntry): Promise<ApiResponse> {
     this.setLoadingState(true, "submitEntry", "Preparing diesel entry...");
     console.log("📝 Submitting diesel entry...");
@@ -1973,12 +2260,23 @@ class EnhancedDieselServiceClass {
         (m) => m.name === entry.machineName
       );
 
+      if (!machine) {
+        this.setLoadingState(false, "submitEntry", "Machine not found");
+        return {
+          success: false,
+          message: `Machine "${entry.machineName}" not found`,
+        };
+      }
+
       let rate = 0;
-      if (machine?.machineType === "KM/l") {
+      if (machine.machineType === "KM/l") {
         rate = entry.dieselFilled > 0 ? usage / entry.dieselFilled : 0;
       } else {
         rate = usage > 0 ? entry.dieselFilled / usage : 0;
       }
+
+      // NEW: Check for warnings but don't prevent submission
+      const warnings = this.checkEntryWarnings(entry, machine, usage, rate);
 
       const entryWithCalculations = {
         ...entry,
@@ -1987,10 +2285,19 @@ class EnhancedDieselServiceClass {
           `entry_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
         usage,
         rate,
-        machineType: machine?.machineType || "L/hr",
+        machineType: machine.machineType || "L/hr",
         timestamp: entry.timestamp || new Date().toISOString(),
         createdAt: entry.createdAt || new Date().toISOString(),
         updatedAt: new Date().toISOString(),
+        // NEW: Add warning information
+        hasWarnings: warnings.length > 0,
+        warningTypes: warnings.map((w) => w.type),
+        warningMessages: warnings.map((w) => w.message),
+        // NEW: Add mismatch calculations
+        consumptionMismatch: rate - (machine.standardAvgDiesel || 0),
+        hoursMismatch: usage - (machine.expectedDailyHours || 0),
+        standardAvg: machine.standardAvgDiesel || 0,
+        expectedDaily: machine.expectedDailyHours || 0,
       };
 
       this.setLoadingState(true, "submitEntry", "Updating local cache...", 40);
@@ -2007,52 +2314,83 @@ class EnhancedDieselServiceClass {
       }
 
       // Update machine's last reading locally
-      if (machine) {
-        const machines = await this.getMachines();
-        const index = machines.findIndex((m) => m.name === entry.machineName);
-        if (index !== -1) {
-          machines[index].lastReading = entry.endReading;
-          machines[index].updatedAt = new Date().toISOString();
-          await this.cacheData(STORAGE_KEYS.MACHINES, machines);
-        }
+      const machines = await this.getMachines();
+      const machineIndex = machines.findIndex(
+        (m) => m.name === entry.machineName
+      );
+      if (machineIndex !== -1) {
+        machines[machineIndex].lastReading = entry.endReading;
+        machines[machineIndex].updatedAt = new Date().toISOString();
+        await this.cacheData(STORAGE_KEYS.MACHINES, machines);
       }
 
+      // NEW: Always try immediate submission even with warnings
       if (
         this.connectionStatus.isConnected &&
         this.connectionStatus.isInternetReachable
       ) {
-        // Try to submit immediately
         try {
           console.log("📡 Attempting immediate submission...");
           this.setLoadingState(
             true,
             "submitEntry",
-            "Submitting to server...",
+            warnings.length > 0
+              ? "Submitting with warnings..."
+              : "Submitting to server...",
             70
           );
 
+          // NEW: Include warning acknowledgment in submission
           const response = await this.makeRequest(CONFIG.APPS_SCRIPT_URL, {
             method: "POST",
             body: JSON.stringify({
               action: "submitEntryEnhanced",
               ...entryWithCalculations,
+              // NEW: Explicit warning acknowledgment
+              acknowledgeWarnings: true,
+              forceSubmit: true, // Force submission even with warnings
               timestamp: Date.now(),
             }),
           });
 
           if (response.success) {
-            console.log("✅ Entry submitted successfully!");
+            console.log(
+              "✅ Entry submitted successfully with warnings acknowledged!"
+            );
+
+            // Store mismatch data locally
+            if (
+              entryWithCalculations.consumptionMismatch !== 0 ||
+              entryWithCalculations.hoursMismatch !== 0
+            ) {
+              await this.storeMismatchData(entryWithCalculations, machine);
+            }
+
             this.setLoadingState(
               false,
               "submitEntry",
-              "Entry submitted successfully!"
+              warnings.length > 0
+                ? "Entry submitted successfully with warnings noted!"
+                : "Entry submitted successfully!"
             );
+
             return {
               success: true,
-              message: "Entry submitted successfully!",
+              message:
+                warnings.length > 0
+                  ? `Entry submitted successfully! ${warnings.length} warning(s) logged for review.`
+                  : "Entry submitted successfully!",
+              hasWarnings: warnings.length > 0,
+              warningMessages: warnings.map((w) => w.message),
+              usage: usage,
+              rate: rate,
+              newLastReading: entry.endReading,
+              machineType: machine.machineType,
             };
           } else {
-            throw new Error(response.message || "Submission failed");
+            // If backend rejects submission, fall through to queuing
+            console.log("⚠️ Backend rejected submission:", response.message);
+            throw new Error(response.message || "Backend submission failed");
           }
         } catch (error) {
           console.log(
@@ -2062,7 +2400,7 @@ class EnhancedDieselServiceClass {
           this.setLoadingState(
             true,
             "submitEntry",
-            "Server unavailable, queuing...",
+            "Server issue, queuing for retry...",
             85
           );
           // Fall through to queue the entry
@@ -2080,9 +2418,17 @@ class EnhancedDieselServiceClass {
       const queueId = await this.addToOfflineQueue(
         "entry",
         entryWithCalculations,
-        5
-      ); // High priority
+        5 // High priority
+      );
       console.log(`📦 Entry queued with ID: ${queueId}`);
+
+      // Store mismatch data locally even when queued
+      if (
+        entryWithCalculations.consumptionMismatch !== 0 ||
+        entryWithCalculations.hoursMismatch !== 0
+      ) {
+        await this.storeMismatchData(entryWithCalculations, machine);
+      }
 
       this.setLoadingState(
         false,
@@ -2095,6 +2441,12 @@ class EnhancedDieselServiceClass {
         message: this.connectionStatus.isInternetReachable
           ? "Entry saved locally and will be submitted when backend connection is restored."
           : "Entry saved locally and queued for submission when online.",
+        hasWarnings: warnings.length > 0,
+        warningMessages: warnings.map((w) => w.message),
+        usage: usage,
+        rate: rate,
+        newLastReading: entry.endReading,
+        machineType: machine.machineType,
       };
     } catch (error) {
       console.error("💥 Error submitting entry:", error);
@@ -2105,6 +2457,182 @@ class EnhancedDieselServiceClass {
           error instanceof Error ? error.message : "Unknown error"
         }`,
       };
+    }
+  }
+
+  // NEW: Check entry warnings without blocking submission
+  private checkEntryWarnings(
+    entry: DieselEntry,
+    machine: Machine,
+    usage: number,
+    rate: number
+  ): Array<{ type: string; message: string; severity: string }> {
+    const warnings: Array<{ type: string; message: string; severity: string }> =
+      [];
+
+    // Over consumption check for L/hr machines
+    if (
+      machine.machineType === "L/hr" &&
+      machine.standardAvgDiesel &&
+      machine.standardAvgDiesel > 0
+    ) {
+      const threshold = machine.standardAvgDiesel * 1.15; // 15% tolerance
+      if (rate > threshold) {
+        const excess = rate - machine.standardAvgDiesel;
+        const severity =
+          excess > machine.standardAvgDiesel * 0.5
+            ? "high"
+            : excess > machine.standardAvgDiesel * 0.25
+            ? "medium"
+            : "low";
+        warnings.push({
+          type: "OVER_CONSUMPTION",
+          message: `⚠️ High consumption: ${rate.toFixed(
+            2
+          )} L/hr vs standard ${machine.standardAvgDiesel.toFixed(
+            2
+          )} L/hr (+${excess.toFixed(2)})`,
+          severity,
+        });
+      }
+    }
+
+    // Low efficiency check for KM/l machines
+    if (
+      machine.machineType === "KM/l" &&
+      machine.standardAvgDiesel &&
+      machine.standardAvgDiesel > 0
+    ) {
+      const threshold = machine.standardAvgDiesel * 0.85; // 15% tolerance
+      if (rate < threshold) {
+        const deficit = machine.standardAvgDiesel - rate;
+        const severity =
+          deficit > machine.standardAvgDiesel * 0.3
+            ? "high"
+            : deficit > machine.standardAvgDiesel * 0.15
+            ? "medium"
+            : "low";
+        warnings.push({
+          type: "LOW_EFFICIENCY",
+          message: `⚠️ Low efficiency: ${rate.toFixed(
+            2
+          )} KM/l vs standard ${machine.standardAvgDiesel.toFixed(
+            2
+          )} KM/l (-${deficit.toFixed(2)})`,
+          severity,
+        });
+      }
+    }
+
+    // Idle machine check
+    if (machine.expectedDailyHours && machine.expectedDailyHours > 0) {
+      const threshold = machine.expectedDailyHours * 0.7; // 30% tolerance
+      if (usage < threshold) {
+        const deficit = machine.expectedDailyHours - usage;
+        const severity =
+          deficit > machine.expectedDailyHours * 0.5
+            ? "high"
+            : deficit > machine.expectedDailyHours * 0.3
+            ? "medium"
+            : "low";
+        warnings.push({
+          type: "IDLE_MACHINE",
+          message: `💤 Low usage: ${usage.toFixed(1)} ${
+            machine.machineType === "KM/l" ? "km" : "hrs"
+          } vs expected ${machine.expectedDailyHours.toFixed(
+            1
+          )} hrs (-${deficit.toFixed(1)})`,
+          severity,
+        });
+      }
+    }
+
+    // Extreme values check
+    if (machine.machineType === "L/hr" && rate > 20) {
+      warnings.push({
+        type: "EXTREME_CONSUMPTION",
+        message: `🚨 Extremely high consumption: ${rate.toFixed(
+          2
+        )} L/hr - please verify readings`,
+        severity: "high",
+      });
+    }
+
+    if (machine.machineType === "KM/l" && rate < 0.5) {
+      warnings.push({
+        type: "EXTREME_INEFFICIENCY",
+        message: `🚨 Extremely low efficiency: ${rate.toFixed(
+          2
+        )} KM/l - please verify readings`,
+        severity: "high",
+      });
+    }
+
+    return warnings;
+  }
+
+  // NEW: Store mismatch data locally and send to backend
+  private async storeMismatchData(
+    entry: DieselEntry,
+    machine: Machine
+  ): Promise<void> {
+    try {
+      const mismatchRecord: MismatchData = {
+        id: `mismatch_${entry.id}_${Date.now()}`,
+        machineName: entry.machineName,
+        plate: machine.plate || "",
+        machineType: machine.machineType || "L/hr",
+        timestamp: entry.timestamp || new Date().toISOString(),
+        consumptionMismatch: entry.consumptionMismatch || 0,
+        hoursMismatch: entry.hoursMismatch || 0,
+        standardConsumption: machine.standardAvgDiesel || 0,
+        actualConsumption: entry.rate || 0,
+        standardHours: machine.expectedDailyHours || 0,
+        actualHours: entry.usage || 0,
+        severity: this.calculateMismatchSeverity(
+          entry.consumptionMismatch || 0,
+          entry.hoursMismatch || 0,
+          machine.machineType
+        ),
+        warningTypes: entry.warningTypes || [],
+      };
+
+      // Store locally
+      const existingMismatch =
+        (await this.getCachedData<MismatchData[]>(
+          STORAGE_KEYS.MISMATCH_DATA
+        )) || [];
+      existingMismatch.unshift(mismatchRecord);
+      await this.cacheData(
+        STORAGE_KEYS.MISMATCH_DATA,
+        existingMismatch.slice(0, 1000)
+      ); // Keep last 1000
+
+      // Try to send to backend if connected
+      if (
+        this.connectionStatus.isConnected &&
+        this.connectionStatus.isInternetReachable
+      ) {
+        try {
+          await this.makeRequest(CONFIG.APPS_SCRIPT_URL, {
+            method: "POST",
+            body: JSON.stringify({
+              action: "storeMismatchData",
+              mismatchData: mismatchRecord,
+              timestamp: Date.now(),
+            }),
+          });
+          console.log("✅ Mismatch data sent to backend successfully");
+        } catch (error) {
+          console.log(
+            "⚠️ Failed to send mismatch data to backend, stored locally"
+          );
+        }
+      }
+
+      console.log(`📊 Mismatch data stored: ${mismatchRecord.id}`);
+    } catch (error) {
+      console.error("❌ Error storing mismatch data:", error);
     }
   }
 
@@ -2816,105 +3344,6 @@ class EnhancedDieselServiceClass {
       return {
         success: false,
         message: `Failed to get machine details: ${
-          error instanceof Error ? error.message : "Unknown error"
-        }`,
-      };
-    }
-  }
-
-  /**
-   * Get deletion history (audit trail)
-   */
-  async getDeletionHistory(): Promise<ApiResponse & { deletions?: any[] }> {
-    try {
-      const deletionHistory =
-        (await this.getCachedData<any[]>("@diesel_tracker:deletion_history")) ||
-        [];
-
-      return {
-        success: true,
-        message: `Retrieved ${deletionHistory.length} deletion records`,
-        deletions: deletionHistory,
-      };
-    } catch (error) {
-      console.error("❌ Error getting deletion history:", error);
-      return {
-        success: false,
-        message: `Failed to get deletion history: ${
-          error instanceof Error ? error.message : "Unknown error"
-        }`,
-      };
-    }
-  }
-
-  async restoreDeletedMachine(deletionRecordId: string): Promise<ApiResponse> {
-    try {
-      const deletionHistory =
-        (await this.getCachedData<any[]>("@diesel_tracker:deletion_history")) ||
-        [];
-      const recordIndex = deletionHistory.findIndex(
-        (record) => record.id === deletionRecordId
-      );
-
-      if (recordIndex === -1) {
-        return {
-          success: false,
-          message: "Deletion record not found",
-        };
-      }
-
-      const deletionRecord = deletionHistory[recordIndex];
-      const machineToRestore = deletionRecord.machineData;
-
-      // Check if machine name/plate conflicts with existing machines
-      const existingMachines = await this.getMachines();
-      const nameConflict = existingMachines.find(
-        (m) => m.name === machineToRestore.name
-      );
-      const plateConflict = existingMachines.find(
-        (m) => m.plate === machineToRestore.plate
-      );
-
-      if (nameConflict || plateConflict) {
-        return {
-          success: false,
-          message:
-            "Cannot restore: Machine name or plate number already exists",
-        };
-      }
-
-      // Restore machine to cache
-      const restoredMachine = {
-        ...machineToRestore,
-        id: `restored_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-        updatedAt: new Date().toISOString(),
-        restoredAt: new Date().toISOString(),
-        restoredFrom: deletionRecordId,
-      };
-
-      existingMachines.push(restoredMachine);
-      await this.cacheData(STORAGE_KEYS.MACHINES, existingMachines);
-
-      // Remove from deletion history
-      deletionHistory.splice(recordIndex, 1);
-      await this.cacheData("@diesel_tracker:deletion_history", deletionHistory);
-
-      // Queue restore operation for backend sync
-      await this.addToOfflineQueue("machine", restoredMachine, 4); // High priority
-
-      return {
-        success: true,
-        message: "Machine restored successfully",
-        restoredMachine: {
-          name: restoredMachine.name,
-          plate: restoredMachine.plate,
-        },
-      };
-    } catch (error) {
-      console.error("❌ Error restoring machine:", error);
-      return {
-        success: false,
-        message: `Failed to restore machine: ${
           error instanceof Error ? error.message : "Unknown error"
         }`,
       };
