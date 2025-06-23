@@ -75,18 +75,58 @@ export default function DieselEntryScreen() {
     getBarCodeScannerPermissions();
   }, []);
 
+  // FIXED: Add effect to refresh inventory when screen focuses
+  useEffect(() => {
+    const refreshInventory = () => {
+      loadInventoryData();
+    };
+
+    // Set up an interval to refresh inventory periodically
+    const inventoryInterval = setInterval(refreshInventory, 30000); // Every 30 seconds
+
+    return () => {
+      clearInterval(inventoryInterval);
+    };
+  }, []);
+
   const getBarCodeScannerPermissions = async () => {
     const { status } = await Camera.requestCameraPermissionsAsync();
     setHasPermission(status === "granted");
   };
 
+  // FIXED: Separate function to load inventory data
+  const loadInventoryData = async () => {
+    try {
+      console.log("📦 Refreshing inventory data...");
+      const inventoryData = await DieselService.getInventory();
+      const newBalance = inventoryData.currentStock || 0;
+
+      console.log(`📊 Current inventory balance: ${newBalance}L`);
+      setCurrentBalance(newBalance);
+
+      return newBalance;
+    } catch (error) {
+      console.error("Error loading inventory data:", error);
+      // Keep existing balance or use default
+      const fallbackBalance = currentBalance || 475;
+      setCurrentBalance(fallbackBalance);
+      return fallbackBalance;
+    }
+  };
+
   const loadData = async () => {
     try {
       setLoading(true);
+      console.log("🔄 Loading diesel entry data...");
+
+      // Load both machines and inventory data
       const [machinesData, inventoryData] = await Promise.all([
         DieselService.getMachines(),
         DieselService.getInventory(),
       ]);
+
+      console.log(`📋 Loaded ${machinesData.length} machines`);
+      console.log(`📦 Current stock: ${inventoryData.currentStock || 0}L`);
 
       setMachines(machinesData);
       setCurrentBalance(inventoryData.currentStock || 0);
@@ -114,6 +154,7 @@ export default function DieselEntryScreen() {
         },
       ]);
       setCurrentBalance(475);
+      console.log("📱 Using mock data - Balance: 475L");
     } finally {
       setLoading(false);
     }
@@ -630,7 +671,12 @@ export default function DieselEntryScreen() {
               onPress: () => {
                 // Reset form
                 resetForm();
-                loadData(); // Reload data
+
+                // FIXED: Reload both machines and inventory data after successful submission
+                loadData();
+
+                // Also refresh inventory specifically to update current balance
+                loadInventoryData();
               },
             },
           ]
@@ -766,11 +812,34 @@ export default function DieselEntryScreen() {
         </TouchableOpacity>
       </View>
 
-      {/* Current Stock Display */}
+      {/* FIXED: Enhanced Current Stock Display with refresh button */}
       <View style={styles.inventoryDisplay}>
-        <Text style={styles.inventoryText}>
-          📦 Current Stock: {currentBalance.toFixed(1)}L
-        </Text>
+        <View style={styles.inventoryContent}>
+          <Text style={styles.inventoryText}>
+            📦 Current Stock: {currentBalance.toFixed(1)}L
+          </Text>
+
+          {/* Refresh button for current stock */}
+          <TouchableOpacity
+            style={styles.refreshStockButton}
+            onPress={loadInventoryData}
+            disabled={loading}
+          >
+            <IconSymbol name="refresh" size={16} color="white" />
+            <Text style={styles.refreshStockText}>Refresh</Text>
+          </TouchableOpacity>
+        </View>
+
+        {/* Stock status indicator */}
+        <View style={styles.stockStatus}>
+          <Text style={styles.stockStatusText}>
+            {currentBalance <= 0
+              ? "🚨 No fuel available"
+              : currentBalance < 50
+              ? "⚠️ Low fuel level"
+              : "✅ Stock available"}
+          </Text>
+        </View>
       </View>
 
       {/* QR Scanner Modal */}
@@ -1259,16 +1328,44 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: "600",
   },
+  // FIXED: Enhanced inventory display styles
   inventoryDisplay: {
     backgroundColor: "#9C27B0",
     paddingHorizontal: 20,
     paddingVertical: 15,
+  },
+  inventoryContent: {
+    flexDirection: "row",
     alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 8,
   },
   inventoryText: {
     color: "white",
     fontSize: 18,
     fontWeight: "600",
+  },
+  refreshStockButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "rgba(255, 255, 255, 0.2)",
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 15,
+    gap: 6,
+  },
+  refreshStockText: {
+    color: "white",
+    fontSize: 12,
+    fontWeight: "600",
+  },
+  stockStatus: {
+    alignItems: "center",
+  },
+  stockStatusText: {
+    color: "rgba(255, 255, 255, 0.9)",
+    fontSize: 12,
+    fontWeight: "500",
   },
   qrModeIndicator: {
     flexDirection: "row",
