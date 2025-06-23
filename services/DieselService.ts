@@ -6,7 +6,7 @@ import * as Network from "expo-network";
 // Configuration
 const CONFIG = {
   APPS_SCRIPT_URL:
-    "https://script.google.com/macros/s/AKfycbxXBRh7D7kZMrFbZfANGg_BXYJp2ibDRdM_YOCRgr9Nt39Fvn6HPvFK1MbmASG6zjSs/exec",
+    "https://script.google.com/macros/s/AKfycbwhIQTtm4ufGjIGiUIO2Ht2NvCDK-jiH9deTaMIBFJuP4QHDPWy1GjXFhx5lSZ9bR9d/exec",
   ADMIN_PASSWORD: "admin123",
   INVENTORY_PASSWORD: "inventory456",
   TIMEOUT: 15000, // Increased to 15 seconds for better stability

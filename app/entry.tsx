@@ -36,27 +36,30 @@ export default function DieselEntryScreen() {
   const [phoneNumber, setPhoneNumber] = useState<string>("");
   const [lastReading, setLastReading] = useState<string>("");
   const [currentReading, setCurrentReading] = useState<string>("");
-  const [confirmReading, setConfirmReading] = useState<string>(""); // Confirmation field
+  const [confirmReading, setConfirmReading] = useState<string>("");
 
   // NEW: Dispenser reading fields
   const [dispenserStartReading, setDispenserStartReading] =
     useState<string>("");
   const [dispenserEndReading, setDispenserEndReading] = useState<string>("");
-  const [dieselFilled, setDieselFilled] = useState<string>(""); // Auto-calculated
+  const [dieselFilled, setDieselFilled] = useState<string>("");
 
   const [remarks, setRemarks] = useState<string>("");
   const [usage, setUsage] = useState<string>("");
   const [rate, setRate] = useState<string>("");
   const [selectedMachineData, setSelectedMachineData] =
     useState<Machine | null>(null);
-  const [imageUri, setImageUri] = useState<string>("");
+
+  // Enhanced image state
+  const [engineImageUri, setEngineImageUri] = useState<string>("");
+  const [operatorImageUri, setOperatorImageUri] = useState<string>(""); // NEW: Operator image
   const [alertMessage, setAlertMessage] = useState<string>("");
 
   // QR Code scanning state
   const [showQRScanner, setShowQRScanner] = useState(false);
   const [hasPermission, setHasPermission] = useState<boolean | null>(null);
   const [scanned, setScanned] = useState(false);
-  const [isQRMode, setIsQRMode] = useState(true); // QR mode is default
+  const [isQRMode, setIsQRMode] = useState(true);
 
   // Validation state
   const [currentReadingError, setCurrentReadingError] = useState<string>("");
@@ -70,23 +73,22 @@ export default function DieselEntryScreen() {
   const [readingsMatch, setReadingsMatch] = useState(true);
   const [dispenserReadingsValid, setDispenserReadingsValid] = useState(true);
 
+  // Image upload state
+  const [uploadingEngine, setUploadingEngine] = useState(false);
+  const [uploadingOperator, setUploadingOperator] = useState(false);
+
   useEffect(() => {
     loadData();
     getBarCodeScannerPermissions();
   }, []);
 
-  // FIXED: Add effect to refresh inventory when screen focuses
   useEffect(() => {
     const refreshInventory = () => {
       loadInventoryData();
     };
 
-    // Set up an interval to refresh inventory periodically
-    const inventoryInterval = setInterval(refreshInventory, 30000); // Every 30 seconds
-
-    return () => {
-      clearInterval(inventoryInterval);
-    };
+    const inventoryInterval = setInterval(refreshInventory, 30000);
+    return () => clearInterval(inventoryInterval);
   }, []);
 
   const getBarCodeScannerPermissions = async () => {
@@ -94,20 +96,16 @@ export default function DieselEntryScreen() {
     setHasPermission(status === "granted");
   };
 
-  // FIXED: Separate function to load inventory data
   const loadInventoryData = async () => {
     try {
       console.log("📦 Refreshing inventory data...");
       const inventoryData = await DieselService.getInventory();
       const newBalance = inventoryData.currentStock || 0;
-
       console.log(`📊 Current inventory balance: ${newBalance}L`);
       setCurrentBalance(newBalance);
-
       return newBalance;
     } catch (error) {
       console.error("Error loading inventory data:", error);
-      // Keep existing balance or use default
       const fallbackBalance = currentBalance || 475;
       setCurrentBalance(fallbackBalance);
       return fallbackBalance;
@@ -119,7 +117,6 @@ export default function DieselEntryScreen() {
       setLoading(true);
       console.log("🔄 Loading diesel entry data...");
 
-      // Load both machines and inventory data
       const [machinesData, inventoryData] = await Promise.all([
         DieselService.getMachines(),
         DieselService.getInventory(),
@@ -132,7 +129,6 @@ export default function DieselEntryScreen() {
       setCurrentBalance(inventoryData.currentStock || 0);
     } catch (error) {
       console.error("Error loading data:", error);
-      // Load mock data
       setMachines([
         {
           name: "JCB-12",
@@ -166,22 +162,16 @@ export default function DieselEntryScreen() {
 
   const parseQRData = (data: string) => {
     try {
-      // Handle deep link format: dieselpro://entry?machineId=JCB-12-AP09AB1234
       if (data.includes("dieselpro://entry?machineId=")) {
         const machineId = data.split("machineId=")[1];
         return decodeURIComponent(machineId);
       }
-
-      // Handle direct machine ID format
       if (data.includes("-")) {
         return data;
       }
-
-      // Handle JSON format (if needed in future)
       const parsed = JSON.parse(data);
       return parsed.machineId || parsed.id || data;
     } catch (error) {
-      // If not JSON, treat as direct machine ID
       return data;
     }
   };
@@ -201,17 +191,15 @@ export default function DieselEntryScreen() {
       console.log("Scanned QR data:", data);
       console.log("Parsed machine ID:", machineId);
 
-      // Find machine by ID
       const machine = machines.find((m) => generateMachineId(m) === machineId);
 
       if (machine) {
-        // Auto-populate machine data
         setSelectedMachine(machine.name);
         setSelectedMachineData(machine);
         setLastReading(machine.lastReading?.toString() || "0");
         setIsQRMode(true);
 
-        // Clear any previous calculations and validations
+        // Clear previous data
         setCurrentReading("");
         setConfirmReading("");
         setDispenserStartReading("");
@@ -237,7 +225,7 @@ export default function DieselEntryScreen() {
             machine.machineType || "L/hr"
           }\nOwnership: ${
             machine.ownershipType || "Own"
-          }\n\nPlease enter:\n1. Current machine reading (twice for verification)\n2. Dispenser start and end readings\n3. Remarks/location`
+          }\n\nPlease enter:\n1. Current machine reading (twice for verification)\n2. Dispenser start and end readings\n3. Remarks/location\n4. Upload operator image`
         );
       } else {
         Alert.alert(
@@ -264,7 +252,7 @@ export default function DieselEntryScreen() {
     setScanned(false);
   };
 
-  // Validation functions
+  // Validation functions (keeping existing ones)
   const validateCurrentReading = (value: string, lastRead: number): boolean => {
     const currentRead = parseFloat(value);
 
@@ -319,7 +307,6 @@ export default function DieselEntryScreen() {
     return true;
   };
 
-  // NEW: Dispenser validation functions
   const validateDispenserReadings = (
     startValue: string,
     endValue: string
@@ -364,7 +351,6 @@ export default function DieselEntryScreen() {
       return false;
     }
 
-    // Calculate diesel filled
     const dieselAmount = end - start;
     setDieselFilled(dieselAmount.toFixed(2));
 
@@ -399,7 +385,6 @@ export default function DieselEntryScreen() {
 
     setRate(rateCalc.toFixed(2));
 
-    // Check for alerts
     if (machineData && usageCalc > 0 && diesel > 0) {
       checkForAlerts(machineData, rateCalc, usageCalc);
     } else {
@@ -407,19 +392,17 @@ export default function DieselEntryScreen() {
     }
   };
 
-  // Event handlers
+  // Event handlers (keeping existing ones and adding new image handlers)
   const handleCurrentReadingChange = (value: string) => {
     setCurrentReading(value);
     const currentRead = parseFloat(value) || 0;
     const lastRead = parseFloat(lastReading) || 0;
     const diesel = parseFloat(dieselFilled) || 0;
 
-    // Validate readings match if confirmation reading exists
     if (confirmReading) {
       validateReadingsMatch(value, confirmReading);
     }
 
-    // Always allow typing, only validate when field loses focus or when moving to next field
     if (value && !isNaN(currentRead)) {
       calculateUsageAndRate(lastRead, currentRead, diesel);
     }
@@ -427,11 +410,8 @@ export default function DieselEntryScreen() {
 
   const handleConfirmReadingChange = (value: string) => {
     setConfirmReading(value);
-
-    // Validate readings match
     validateReadingsMatch(currentReading, value);
 
-    // If readings match, use the confirmed value for calculations
     if (
       currentReading &&
       value &&
@@ -460,15 +440,12 @@ export default function DieselEntryScreen() {
     validateReadingsMatch(currentReading, confirmReading);
   };
 
-  // NEW: Dispenser reading handlers
   const handleDispenserStartChange = (value: string) => {
     setDispenserStartReading(value);
 
-    // Validate and calculate if both readings are present
     if (dispenserEndReading) {
       const isValid = validateDispenserReadings(value, dispenserEndReading);
       if (isValid) {
-        // Recalculate usage and rate with new diesel amount
         const currentRead = parseFloat(confirmReading || currentReading) || 0;
         const lastRead = parseFloat(lastReading) || 0;
         const diesel = parseFloat(dieselFilled) || 0;
@@ -480,11 +457,9 @@ export default function DieselEntryScreen() {
   const handleDispenserEndChange = (value: string) => {
     setDispenserEndReading(value);
 
-    // Validate and calculate if both readings are present
     if (dispenserStartReading) {
       const isValid = validateDispenserReadings(dispenserStartReading, value);
       if (isValid) {
-        // Recalculate usage and rate with new diesel amount
         const currentRead = parseFloat(confirmReading || currentReading) || 0;
         const lastRead = parseFloat(lastReading) || 0;
         const diesel = parseFloat(dieselFilled) || 0;
@@ -515,7 +490,6 @@ export default function DieselEntryScreen() {
 
     let alerts: string[] = [];
 
-    // Over consumption check
     if (standardAvg > 0) {
       if (
         machine.machineType === "KM/l" &&
@@ -547,7 +521,6 @@ export default function DieselEntryScreen() {
       }
     }
 
-    // Idle machine check
     if (
       machine.machineType === "L/hr" &&
       expectedDaily > 0 &&
@@ -561,6 +534,131 @@ export default function DieselEntryScreen() {
     }
 
     setAlertMessage(alerts.join(" "));
+  };
+
+  // NEW: Enhanced image handling functions
+  const uploadImageToBackend = async (
+    imageUri: string,
+    type: "engine" | "operator"
+  ): Promise<string> => {
+    try {
+      const fileName = `${type}_${selectedMachine}_${Date.now()}.jpg`;
+      const uploadedUrl = await DieselService.uploadImage(imageUri, fileName);
+
+      if (uploadedUrl) {
+        console.log(`✅ ${type} image uploaded successfully:`, uploadedUrl);
+        return uploadedUrl;
+      } else {
+        console.log(`⚠️ ${type} image upload failed, using local URI`);
+        return imageUri; // Fallback to local URI
+      }
+    } catch (error) {
+      console.error(`❌ Error uploading ${type} image:`, error);
+      return imageUri; // Fallback to local URI
+    }
+  };
+
+  const pickImage = async (type: "engine" | "operator") => {
+    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+
+    if (status !== "granted") {
+      Alert.alert(
+        "Permission needed",
+        "Camera roll permissions are required to select images."
+      );
+      return;
+    }
+
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      allowsEditing: true,
+      aspect: [4, 3],
+      quality: 0.6,
+    });
+
+    if (!result.canceled && result.assets[0]) {
+      const imageUri = result.assets[0].uri;
+
+      if (type === "engine") {
+        setEngineImageUri(imageUri);
+        // Upload engine image immediately
+        setUploadingEngine(true);
+        try {
+          const uploadedUrl = await uploadImageToBackend(imageUri, "engine");
+          setEngineImageUri(uploadedUrl);
+        } finally {
+          setUploadingEngine(false);
+        }
+      } else {
+        setOperatorImageUri(imageUri);
+        // Upload operator image immediately
+        setUploadingOperator(true);
+        try {
+          const uploadedUrl = await uploadImageToBackend(imageUri, "operator");
+          setOperatorImageUri(uploadedUrl);
+        } finally {
+          setUploadingOperator(false);
+        }
+      }
+    }
+  };
+
+  const takePicture = async (type: "engine" | "operator") => {
+    const { status } = await ImagePicker.requestCameraPermissionsAsync();
+
+    if (status !== "granted") {
+      Alert.alert(
+        "Permission needed",
+        "Camera permissions are required to take pictures."
+      );
+      return;
+    }
+
+    const result = await ImagePicker.launchCameraAsync({
+      allowsEditing: true,
+      aspect: [4, 3],
+      quality: 0.6,
+    });
+
+    if (!result.canceled && result.assets[0]) {
+      const imageUri = result.assets[0].uri;
+
+      if (type === "engine") {
+        setEngineImageUri(imageUri);
+        // Upload engine image immediately
+        setUploadingEngine(true);
+        try {
+          const uploadedUrl = await uploadImageToBackend(imageUri, "engine");
+          setEngineImageUri(uploadedUrl);
+        } finally {
+          setUploadingEngine(false);
+        }
+      } else {
+        setOperatorImageUri(imageUri);
+        // Upload operator image immediately
+        setUploadingOperator(true);
+        try {
+          const uploadedUrl = await uploadImageToBackend(imageUri, "operator");
+          setOperatorImageUri(uploadedUrl);
+        } finally {
+          setUploadingOperator(false);
+        }
+      }
+    }
+  };
+
+  const showImageOptions = (type: "engine" | "operator") => {
+    const title = type === "engine" ? "Engine Reading Image" : "Operator Image";
+    const message =
+      type === "engine"
+        ? "Choose how to add engine reading image"
+        : "Choose how to add operator image";
+
+    Alert.alert(title, message, [
+      { text: "Camera", onPress: () => takePicture(type) },
+      { text: "Gallery", onPress: () => pickImage(type) },
+      { text: "Cancel", style: "cancel" },
+    ]);
   };
 
   const validateForm = (): boolean => {
@@ -604,7 +702,6 @@ export default function DieselEntryScreen() {
       return false;
     }
 
-    // NEW: Validate dispenser readings
     const dispenserStart = parseFloat(dispenserStartReading);
     const dispenserEnd = parseFloat(dispenserEndReading);
 
@@ -637,6 +734,15 @@ export default function DieselEntryScreen() {
       return false;
     }
 
+    // NEW: Operator image validation (required)
+    if (!operatorImageUri) {
+      Alert.alert(
+        "Error",
+        "Please upload operator image (required for verification)"
+      );
+      return false;
+    }
+
     return true;
   };
 
@@ -649,12 +755,12 @@ export default function DieselEntryScreen() {
       const entryData = {
         machineName: selectedMachine,
         startReading: parseFloat(lastReading) || 0,
-        endReading: parseFloat(confirmReading) || 0, // Use confirmed reading
-        dieselFilled: parseFloat(dieselFilled) || 0, // Auto-calculated from dispenser readings
+        endReading: parseFloat(confirmReading) || 0,
+        dieselFilled: parseFloat(dieselFilled) || 0,
         remarks: remarks,
         phoneNumber: phoneNumber.replace(/\D/g, ""),
-        imageURL: imageUri || "",
-        // NEW: Add dispenser readings to the data
+        imageURL: engineImageUri || "", // Engine reading image
+        operatorImageURL: operatorImageUri, // NEW: Operator image
         dispenserStartReading: parseFloat(dispenserStartReading) || 0,
         dispenserEndReading: parseFloat(dispenserEndReading) || 0,
       };
@@ -669,13 +775,8 @@ export default function DieselEntryScreen() {
             {
               text: "OK",
               onPress: () => {
-                // Reset form
                 resetForm();
-
-                // FIXED: Reload both machines and inventory data after successful submission
                 loadData();
-
-                // Also refresh inventory specifically to update current balance
                 loadInventoryData();
               },
             },
@@ -705,7 +806,8 @@ export default function DieselEntryScreen() {
     setUsage("");
     setRate("");
     setSelectedMachineData(null);
-    setImageUri("");
+    setEngineImageUri("");
+    setOperatorImageUri(""); // NEW: Reset operator image
     setAlertMessage("");
     setCurrentReadingError("");
     setConfirmReadingError("");
@@ -717,59 +819,6 @@ export default function DieselEntryScreen() {
     setIsValidDispenserEnd(true);
     setReadingsMatch(true);
     setDispenserReadingsValid(true);
-  };
-
-  const pickImage = async () => {
-    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
-
-    if (status !== "granted") {
-      Alert.alert(
-        "Permission needed",
-        "Camera roll permissions are required to select images."
-      );
-      return;
-    }
-
-    const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
-      allowsEditing: true,
-      aspect: [4, 3],
-      quality: 0.6,
-    });
-
-    if (!result.canceled && result.assets[0]) {
-      setImageUri(result.assets[0].uri);
-    }
-  };
-
-  const takePicture = async () => {
-    const { status } = await ImagePicker.requestCameraPermissionsAsync();
-
-    if (status !== "granted") {
-      Alert.alert(
-        "Permission needed",
-        "Camera permissions are required to take pictures."
-      );
-      return;
-    }
-
-    const result = await ImagePicker.launchCameraAsync({
-      allowsEditing: true,
-      aspect: [4, 3],
-      quality: 0.6,
-    });
-
-    if (!result.canceled && result.assets[0]) {
-      setImageUri(result.assets[0].uri);
-    }
-  };
-
-  const showImageOptions = () => {
-    Alert.alert("Select Image", "Choose how to add an image", [
-      { text: "Camera", onPress: takePicture },
-      { text: "Gallery", onPress: pickImage },
-      { text: "Cancel", style: "cancel" },
-    ]);
   };
 
   return (
@@ -787,7 +836,6 @@ export default function DieselEntryScreen() {
           📝 Daily Diesel Entry (QR Mode)
         </ThemedText>
 
-        {/* QR Scanner Button */}
         <TouchableOpacity
           style={styles.qrScanButton}
           onPress={() => {
@@ -812,14 +860,13 @@ export default function DieselEntryScreen() {
         </TouchableOpacity>
       </View>
 
-      {/* FIXED: Enhanced Current Stock Display with refresh button */}
+      {/* Enhanced Current Stock Display */}
       <View style={styles.inventoryDisplay}>
         <View style={styles.inventoryContent}>
           <Text style={styles.inventoryText}>
             📦 Current Stock: {currentBalance.toFixed(1)}L
           </Text>
 
-          {/* Refresh button for current stock */}
           <TouchableOpacity
             style={styles.refreshStockButton}
             onPress={loadInventoryData}
@@ -830,7 +877,6 @@ export default function DieselEntryScreen() {
           </TouchableOpacity>
         </View>
 
-        {/* Stock status indicator */}
         <View style={styles.stockStatus}>
           <Text style={styles.stockStatusText}>
             {currentBalance <= 0
@@ -1036,7 +1082,6 @@ export default function DieselEntryScreen() {
         <View style={styles.readingsSection}>
           <Text style={styles.sectionTitle}>📊 Machine Readings</Text>
 
-          {/* Last Reading */}
           <View style={styles.formGroup}>
             <Text style={styles.label}>
               {selectedMachineData?.machineType === "KM/l"
@@ -1050,7 +1095,6 @@ export default function DieselEntryScreen() {
             />
           </View>
 
-          {/* Current Reading - First Entry */}
           <View style={styles.formGroup}>
             <Text style={styles.label}>
               {selectedMachineData?.machineType === "KM/l"
@@ -1073,7 +1117,6 @@ export default function DieselEntryScreen() {
             ) : null}
           </View>
 
-          {/* Current Reading - Confirmation */}
           <View style={styles.formGroup}>
             <Text style={styles.label}>
               {selectedMachineData?.machineType === "KM/l"
@@ -1109,11 +1152,10 @@ export default function DieselEntryScreen() {
           </View>
         </View>
 
-        {/* NEW: Dispenser Readings Section */}
+        {/* Dispenser Readings Section */}
         <View style={styles.dispenserSection}>
           <Text style={styles.sectionTitle}>⛽ Diesel Dispenser Readings</Text>
 
-          {/* Dispenser Start Reading */}
           <View style={styles.formGroup}>
             <Text style={styles.label}>Dispenser Start Reading *</Text>
             <TextInput
@@ -1132,7 +1174,6 @@ export default function DieselEntryScreen() {
             ) : null}
           </View>
 
-          {/* Dispenser End Reading */}
           <View style={styles.formGroup}>
             <Text style={styles.label}>Dispenser End Reading *</Text>
             <TextInput
@@ -1155,7 +1196,6 @@ export default function DieselEntryScreen() {
             ) : null}
           </View>
 
-          {/* Auto-calculated Diesel Filled (Read-only) */}
           <View style={styles.formGroup}>
             <Text style={styles.label}>
               Diesel Filled (Liters) - Auto Calculated
@@ -1226,36 +1266,132 @@ export default function DieselEntryScreen() {
           </View>
         ) : null}
 
-        {/* Image Upload */}
-        <View style={styles.formGroup}>
-          <Text style={styles.label}>Engine Reading Image (Optional)</Text>
-          <TouchableOpacity
-            style={styles.imageButton}
-            onPress={showImageOptions}
-          >
-            <IconSymbol
-              name="camera.fill"
-              size={24}
-              color={Colors[colorScheme ?? "light"].tint}
-            />
-            <Text style={styles.imageButtonText}>Add Image</Text>
-          </TouchableOpacity>
+        {/* Enhanced Image Upload Section */}
+        <View style={styles.imageSection}>
+          <Text style={styles.sectionTitle}>📷 Upload Images</Text>
 
-          {imageUri ? (
-            <View style={styles.imageContainer}>
-              <Image source={{ uri: imageUri }} style={styles.imagePreview} />
-              <TouchableOpacity
-                style={styles.removeImageButton}
-                onPress={() => setImageUri("")}
-              >
-                <IconSymbol
-                  name="xmark.circle.fill"
-                  size={24}
-                  color="#dc3545"
+          {/* Engine Reading Image */}
+          <View style={styles.formGroup}>
+            <Text style={styles.label}>Engine Reading Image (Optional)</Text>
+            <TouchableOpacity
+              style={styles.imageButton}
+              onPress={() => showImageOptions("engine")}
+              disabled={uploadingEngine}
+            >
+              {uploadingEngine ? (
+                <Text style={styles.imageButtonText}>Uploading...</Text>
+              ) : (
+                <>
+                  <IconSymbol
+                    name="camera.fill"
+                    size={24}
+                    color={Colors[colorScheme ?? "light"].tint}
+                  />
+                  <Text style={styles.imageButtonText}>
+                    Add Engine Reading Image
+                  </Text>
+                </>
+              )}
+            </TouchableOpacity>
+
+            {engineImageUri ? (
+              <View style={styles.imageContainer}>
+                <Image
+                  source={{ uri: engineImageUri }}
+                  style={styles.imagePreview}
                 />
-              </TouchableOpacity>
-            </View>
-          ) : null}
+                <TouchableOpacity
+                  style={styles.removeImageButton}
+                  onPress={() => setEngineImageUri("")}
+                >
+                  <IconSymbol
+                    name="xmark.circle.fill"
+                    size={24}
+                    color="#dc3545"
+                  />
+                </TouchableOpacity>
+                <View style={styles.imageSuccessOverlay}>
+                  <IconSymbol
+                    name="checkmark.circle"
+                    size={20}
+                    color="#28a745"
+                  />
+                </View>
+              </View>
+            ) : null}
+          </View>
+
+          {/* NEW: Operator Image */}
+          <View style={styles.formGroup}>
+            <Text style={styles.label}>
+              Operator Image *{" "}
+              <Text style={styles.requiredText}>
+                (Required for verification)
+              </Text>
+            </Text>
+            <TouchableOpacity
+              style={[
+                styles.imageButton,
+                !operatorImageUri && styles.imageButtonRequired,
+                operatorImageUri && styles.imageButtonSuccess,
+              ]}
+              onPress={() => showImageOptions("operator")}
+              disabled={uploadingOperator}
+            >
+              {uploadingOperator ? (
+                <Text style={styles.imageButtonText}>Uploading...</Text>
+              ) : (
+                <>
+                  <IconSymbol
+                    name="camera.fill"
+                    size={24}
+                    color={operatorImageUri ? "#28a745" : "#dc3545"}
+                  />
+                  <Text
+                    style={[
+                      styles.imageButtonText,
+                      { color: operatorImageUri ? "#28a745" : "#dc3545" },
+                    ]}
+                  >
+                    {operatorImageUri
+                      ? "Operator Photo Added ✅"
+                      : "Add Operator Photo (Required)"}
+                  </Text>
+                </>
+              )}
+            </TouchableOpacity>
+
+            <Text style={styles.imageNote}>
+              📷 Clear photo of the machine operator for verification and safety
+              records
+            </Text>
+
+            {operatorImageUri ? (
+              <View style={styles.imageContainer}>
+                <Image
+                  source={{ uri: operatorImageUri }}
+                  style={styles.imagePreview}
+                />
+                <TouchableOpacity
+                  style={styles.removeImageButton}
+                  onPress={() => setOperatorImageUri("")}
+                >
+                  <IconSymbol
+                    name="xmark.circle.fill"
+                    size={24}
+                    color="#dc3545"
+                  />
+                </TouchableOpacity>
+                <View style={styles.imageSuccessOverlay}>
+                  <IconSymbol
+                    name="checkmark.circle"
+                    size={20}
+                    color="#28a745"
+                  />
+                </View>
+              </View>
+            ) : null}
+          </View>
         </View>
 
         {/* Submit Button */}
@@ -1264,7 +1400,10 @@ export default function DieselEntryScreen() {
             styles.submitButton,
             {
               backgroundColor:
-                currentBalance <= 0 || !readingsMatch || !dispenserReadingsValid
+                currentBalance <= 0 ||
+                !readingsMatch ||
+                !dispenserReadingsValid ||
+                !operatorImageUri
                   ? "#6c757d"
                   : Colors[colorScheme ?? "light"].tint,
               opacity: loading ? 0.7 : 1,
@@ -1275,7 +1414,8 @@ export default function DieselEntryScreen() {
             loading ||
             currentBalance <= 0 ||
             !readingsMatch ||
-            !dispenserReadingsValid
+            !dispenserReadingsValid ||
+            !operatorImageUri
           }
         >
           <Text style={styles.submitButtonText}>
@@ -1287,6 +1427,8 @@ export default function DieselEntryScreen() {
               ? "Verify Machine Readings First"
               : !dispenserReadingsValid
               ? "Check Dispenser Readings"
+              : !operatorImageUri
+              ? "Operator Photo Required"
               : "Submit Entry"}
           </Text>
         </TouchableOpacity>
@@ -1328,7 +1470,6 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: "600",
   },
-  // FIXED: Enhanced inventory display styles
   inventoryDisplay: {
     backgroundColor: "#9C27B0",
     paddingHorizontal: 20,
@@ -1407,7 +1548,6 @@ const styles = StyleSheet.create({
     borderLeftWidth: 4,
     borderLeftColor: "#007bff",
   },
-  // NEW: Dispenser section styles
   dispenserSection: {
     backgroundColor: "#fff8e1",
     borderRadius: 12,
@@ -1415,6 +1555,14 @@ const styles = StyleSheet.create({
     marginBottom: 20,
     borderLeftWidth: 4,
     borderLeftColor: "#ff9800",
+  },
+  imageSection: {
+    backgroundColor: "#f0f8ff",
+    borderRadius: 12,
+    padding: 15,
+    marginBottom: 20,
+    borderLeftWidth: 4,
+    borderLeftColor: "#17a2b8",
   },
   calculatedInput: {
     backgroundColor: "#e8f5e8",
@@ -1452,6 +1600,11 @@ const styles = StyleSheet.create({
     fontWeight: "400",
     color: "#666",
     fontStyle: "italic",
+  },
+  requiredText: {
+    color: "#dc3545",
+    fontSize: 14,
+    fontWeight: "bold",
   },
   input: {
     borderWidth: 2,
@@ -1571,9 +1724,23 @@ const styles = StyleSheet.create({
     padding: 15,
     gap: 10,
   },
+  imageButtonRequired: {
+    borderColor: "#dc3545",
+    backgroundColor: "#fff5f5",
+  },
+  imageButtonSuccess: {
+    borderColor: "#28a745",
+    backgroundColor: "#f0fff4",
+  },
   imageButtonText: {
     fontSize: 16,
     fontWeight: "600",
+  },
+  imageNote: {
+    fontSize: 12,
+    color: "#666",
+    marginTop: 5,
+    fontStyle: "italic",
   },
   imageContainer: {
     marginTop: 10,
@@ -1590,6 +1757,14 @@ const styles = StyleSheet.create({
     right: 10,
     backgroundColor: "white",
     borderRadius: 12,
+  },
+  imageSuccessOverlay: {
+    position: "absolute",
+    bottom: 10,
+    right: 10,
+    backgroundColor: "rgba(255, 255, 255, 0.9)",
+    borderRadius: 16,
+    padding: 4,
   },
   submitButton: {
     padding: 15,
