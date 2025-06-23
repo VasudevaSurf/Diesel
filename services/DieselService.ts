@@ -38,6 +38,26 @@ const DEBUG_MODE = __DEV__;
 const connectionListeners: ((status: ConnectionStatus) => void)[] = [];
 
 // Types
+export interface LoadingState {
+  isLoading: boolean;
+  operation: string;
+  progress?: number;
+  message?: string;
+  startTime?: number;
+}
+
+export interface EnhancedConnectionStatus extends ConnectionStatus {
+  loadingState?: LoadingState;
+  lastDataFetch?: {
+    machines: string;
+    inventory: string;
+    logs: string;
+    alerts: string;
+  };
+}
+
+const loadingListeners: ((state: LoadingState) => void)[] = [];
+
 export interface Machine {
   name: string;
   plate: string;
@@ -219,12 +239,24 @@ export interface MachinePerformanceAnalytics {
   };
 }
 
-class DieselServiceClass {
-  private connectionStatus: ConnectionStatus = {
+class EnhancedDieselServiceClass {
+  private connectionStatus: EnhancedConnectionStatus = {
     isConnected: false,
     isInternetReachable: false,
     lastChecked: new Date().toISOString(),
     hasRealData: false,
+    loadingState: { isLoading: false, operation: "idle" },
+    lastDataFetch: {
+      machines: "",
+      inventory: "",
+      logs: "",
+      alerts: "",
+    },
+  };
+
+  private currentLoadingState: LoadingState = {
+    isLoading: false,
+    operation: "idle",
   };
 
   private offlineQueue: QueuedItem[] = [];
@@ -238,6 +270,54 @@ class DieselServiceClass {
 
   constructor() {
     this.initializeService();
+  }
+
+  addLoadingListener(callback: (state: LoadingState) => void): () => void {
+    loadingListeners.push(callback);
+    // Immediately call with current state
+    callback(this.currentLoadingState);
+
+    return () => {
+      const index = loadingListeners.indexOf(callback);
+      if (index > -1) {
+        loadingListeners.splice(index, 1);
+      }
+    };
+  }
+
+  private notifyLoadingListeners(): void {
+    loadingListeners.forEach((listener) => {
+      try {
+        listener(this.currentLoadingState);
+      } catch (error) {
+        console.error("Error in loading listener:", error);
+      }
+    });
+  }
+
+  private setLoadingState(
+    isLoading: boolean,
+    operation: string,
+    message?: string,
+    progress?: number
+  ): void {
+    this.currentLoadingState = {
+      isLoading,
+      operation,
+      message,
+      progress,
+      startTime: isLoading ? Date.now() : this.currentLoadingState.startTime,
+    };
+
+    this.connectionStatus.loadingState = this.currentLoadingState;
+
+    console.log(
+      `🔄 Loading: ${operation} - ${isLoading ? "Started" : "Completed"}${
+        message ? ` (${message})` : ""
+      }${progress ? ` - ${progress}%` : ""}`
+    );
+
+    this.notifyLoadingListeners();
   }
 
   // Add connection listener for real-time updates
@@ -556,9 +636,17 @@ class DieselServiceClass {
 
   // Manual connection check (can be called by UI)
   async checkConnection(): Promise<boolean> {
+    this.setLoadingState(true, "checkConnection", "Checking connection...");
     console.log("🔍 Manual connection check requested...");
 
     try {
+      this.setLoadingState(
+        true,
+        "checkConnection",
+        "Checking network status...",
+        25
+      );
+
       // Get current network state
       let netInfoState;
       try {
@@ -589,9 +677,21 @@ class DieselServiceClass {
           this.connectionStatus
         );
         this.notifyConnectionListeners();
+        this.setLoadingState(
+          false,
+          "checkConnection",
+          "No internet connection"
+        );
         console.log("❌ No internet connection");
         return false;
       }
+
+      this.setLoadingState(
+        true,
+        "checkConnection",
+        "Internet available, checking backend...",
+        60
+      );
 
       // Update internet status
       this.connectionStatus.isInternetReachable = true;
@@ -599,7 +699,20 @@ class DieselServiceClass {
       this.connectionStatus.error = undefined;
 
       // Check backend connection
+      this.setLoadingState(
+        true,
+        "checkConnection",
+        "Testing backend connection...",
+        80
+      );
       const isConnected = await this.checkBackendConnection();
+
+      this.setLoadingState(
+        false,
+        "checkConnection",
+        isConnected ? "Connected to backend" : "Backend unavailable"
+      );
+
       this.notifyConnectionListeners();
       return isConnected;
     } catch (error) {
@@ -616,7 +729,171 @@ class DieselServiceClass {
         this.connectionStatus
       );
       this.notifyConnectionListeners();
+      this.setLoadingState(false, "checkConnection", "Connection check failed");
       return false;
+    }
+  }
+
+  getCurrentLoadingState(): LoadingState {
+    return { ...this.currentLoadingState };
+  }
+
+  // Get loading state for specific operation
+  isOperationLoading(operation: string): boolean {
+    return (
+      this.currentLoadingState.isLoading &&
+      this.currentLoadingState.operation === operation
+    );
+  }
+
+  // Clear loading state (useful for error handling)
+  clearLoadingState(): void {
+    this.setLoadingState(false, "idle");
+  }
+
+  // Get data freshness info
+  getDataFreshness(): { [key: string]: { age: number; source: string } } {
+    const now = Date.now();
+    const lastFetch = this.connectionStatus.lastDataFetch || {};
+
+    return {
+      machines: {
+        age: lastFetch.machines
+          ? now - new Date(lastFetch.machines).getTime()
+          : -1,
+        source: this.connectionStatus.hasRealData
+          ? this.connectionStatus.isConnected
+            ? "live"
+            : "cached"
+          : "demo",
+      },
+      inventory: {
+        age: lastFetch.inventory
+          ? now - new Date(lastFetch.inventory).getTime()
+          : -1,
+        source: this.connectionStatus.hasRealData
+          ? this.connectionStatus.isConnected
+            ? "live"
+            : "cached"
+          : "demo",
+      },
+      logs: {
+        age: lastFetch.logs ? now - new Date(lastFetch.logs).getTime() : -1,
+        source: this.connectionStatus.hasRealData
+          ? this.connectionStatus.isConnected
+            ? "live"
+            : "cached"
+          : "demo",
+      },
+      alerts: {
+        age: lastFetch.alerts ? now - new Date(lastFetch.alerts).getTime() : -1,
+        source: this.connectionStatus.hasRealData
+          ? this.connectionStatus.isConnected
+            ? "live"
+            : "cached"
+          : "demo",
+      },
+    };
+  }
+  async loadAllData(forceRefresh: boolean = false): Promise<{
+    machines: Machine[];
+    inventory: { currentStock: number; transactions: InventoryEntry[] };
+    logs: DieselEntry[];
+    alerts: AlertData;
+    loadingResults: { [key: string]: { success: boolean; message: string } };
+  }> {
+    this.setLoadingState(true, "loadAllData", "Loading all dashboard data...");
+
+    const results = {
+      machines: [] as Machine[],
+      inventory: { currentStock: 0, transactions: [] as InventoryEntry[] },
+      logs: [] as DieselEntry[],
+      alerts: { overConsumption: [], idleMachines: [] } as AlertData,
+      loadingResults: {} as {
+        [key: string]: { success: boolean; message: string };
+      },
+    };
+
+    try {
+      // Load machines
+      this.setLoadingState(true, "loadAllData", "Loading machines...", 25);
+      try {
+        results.machines = await this.getMachines();
+        results.loadingResults.machines = {
+          success: true,
+          message: `Loaded ${results.machines.length} machines`,
+        };
+      } catch (error) {
+        results.loadingResults.machines = {
+          success: false,
+          message: `Failed to load machines: ${error}`,
+        };
+      }
+
+      // Load inventory
+      this.setLoadingState(true, "loadAllData", "Loading inventory...", 50);
+      try {
+        results.inventory = await this.getInventory();
+        results.loadingResults.inventory = {
+          success: true,
+          message: `Loaded inventory: ${results.inventory.currentStock.toFixed(
+            1
+          )}L`,
+        };
+      } catch (error) {
+        results.loadingResults.inventory = {
+          success: false,
+          message: `Failed to load inventory: ${error}`,
+        };
+      }
+
+      // Load logs
+      this.setLoadingState(true, "loadAllData", "Loading logs...", 75);
+      try {
+        const logsResult = await this.getLogs();
+        results.logs = logsResult.logs;
+        results.loadingResults.logs = {
+          success: logsResult.success,
+          message: `Loaded ${results.logs.length} logs`,
+        };
+      } catch (error) {
+        results.loadingResults.logs = {
+          success: false,
+          message: `Failed to load logs: ${error}`,
+        };
+      }
+
+      // Load alerts
+      this.setLoadingState(true, "loadAllData", "Loading alerts...", 90);
+      try {
+        const alertsResult = await this.getAlertsData();
+        results.alerts = alertsResult.alerts;
+        const totalAlerts =
+          (results.alerts.overConsumption?.length || 0) +
+          (results.alerts.idleMachines?.length || 0);
+        results.loadingResults.alerts = {
+          success: alertsResult.success,
+          message: `Loaded ${totalAlerts} alerts`,
+        };
+      } catch (error) {
+        results.loadingResults.alerts = {
+          success: false,
+          message: `Failed to load alerts: ${error}`,
+        };
+      }
+
+      this.setLoadingState(
+        false,
+        "loadAllData",
+        "All data loaded successfully"
+      );
+      console.log("✅ Batch data loading completed", results.loadingResults);
+
+      return results;
+    } catch (error) {
+      console.error("❌ Error in batch data loading:", error);
+      this.setLoadingState(false, "loadAllData", "Batch loading failed");
+      throw error;
     }
   }
 
@@ -704,6 +981,8 @@ class DieselServiceClass {
 
   // Enhanced data retrieval with real-time status
   async getMachines(): Promise<Machine[]> {
+    this.setLoadingState(true, "machines", "Loading machine data...");
+
     try {
       console.log(
         `📋 Getting machines... (Connected: ${this.connectionStatus.isConnected}, Internet: ${this.connectionStatus.isInternetReachable})`
@@ -714,27 +993,47 @@ class DieselServiceClass {
         !this.connectionStatus.isInternetReachable
       ) {
         console.log("📱 Using cached/offline data for machines");
+        this.setLoadingState(true, "machines", "Loading from cache...", 50);
+
         const cached = await this.getCachedData<Machine[]>(
           STORAGE_KEYS.MACHINES
         );
 
         if (cached && cached.length > 0) {
           console.log(`✅ Returning ${cached.length} cached machines`);
+          this.connectionStatus.lastDataFetch!.machines =
+            new Date().toISOString();
+          this.setLoadingState(
+            false,
+            "machines",
+            `Loaded ${cached.length} machines from cache`
+          );
           return cached;
         } else if (this.connectionStatus.hasRealData) {
           console.log("⚠️ No cached machines but should have real data");
+          this.setLoadingState(false, "machines", "No cached data available");
           return [];
         } else {
           console.log("🎭 No cached data, returning demo machines");
-          return this.getMockMachines();
+          const mockData = this.getMockMachines();
+          this.setLoadingState(
+            false,
+            "machines",
+            `Loaded ${mockData.length} demo machines`
+          );
+          return mockData;
         }
       }
 
       // Try to fetch from backend
       console.log("📡 Fetching machines from backend...");
+      this.setLoadingState(true, "machines", "Connecting to server...", 25);
+
       const response = await this.makeRequest<{ machines: Machine[] }>(
         `${CONFIG.APPS_SCRIPT_URL}?action=getMachines&timestamp=${Date.now()}`
       );
+
+      this.setLoadingState(true, "machines", "Processing response...", 75);
 
       if (response.success && response.machines) {
         console.log(
@@ -746,33 +1045,58 @@ class DieselServiceClass {
 
         // Mark that we have real data
         this.connectionStatus.hasRealData = true;
+        this.connectionStatus.lastDataFetch!.machines =
+          new Date().toISOString();
         await this.cacheData(STORAGE_KEYS.HAS_REAL_DATA, true);
         await this.cacheData(
           STORAGE_KEYS.CONNECTION_STATUS,
           this.connectionStatus
         );
 
+        this.setLoadingState(
+          false,
+          "machines",
+          `Loaded ${response.machines.length} machines from server`
+        );
         return response.machines;
       } else {
         throw new Error(response.message || "Failed to fetch machines");
       }
     } catch (error) {
       console.error("❌ Error fetching machines:", error);
+      this.setLoadingState(
+        true,
+        "machines",
+        "Server error, checking cache...",
+        60
+      );
 
       // Try to return cached data
       const cached = await this.getCachedData<Machine[]>(STORAGE_KEYS.MACHINES);
       if (cached && cached.length > 0) {
         console.log(`📱 Fallback to ${cached.length} cached machines`);
+        this.setLoadingState(
+          false,
+          "machines",
+          `Loaded ${cached.length} machines from cache (offline)`
+        );
         return cached;
       }
 
       // Only return mock data if we've never had real data
       if (!this.connectionStatus.hasRealData) {
         console.log("🎭 Fallback to demo machines (no real data ever fetched)");
-        return this.getMockMachines();
+        const mockData = this.getMockMachines();
+        this.setLoadingState(
+          false,
+          "machines",
+          `Loaded ${mockData.length} demo machines (first time)`
+        );
+        return mockData;
       }
 
       console.log("📭 No machines available");
+      this.setLoadingState(false, "machines", "No data available");
       return [];
     }
   }
@@ -781,6 +1105,8 @@ class DieselServiceClass {
     currentStock: number;
     transactions: InventoryEntry[];
   }> {
+    this.setLoadingState(true, "inventory", "Loading inventory data...");
+
     try {
       console.log(
         `📦 Getting inventory... (Connected: ${this.connectionStatus.isConnected}, Internet: ${this.connectionStatus.isInternetReachable})`
@@ -791,6 +1117,8 @@ class DieselServiceClass {
         !this.connectionStatus.isInternetReachable
       ) {
         console.log("📱 Using cached/offline inventory data");
+        this.setLoadingState(true, "inventory", "Loading from cache...", 50);
+
         const cached = await this.getCachedData<{
           currentStock: number;
           transactions: InventoryEntry[];
@@ -800,22 +1128,44 @@ class DieselServiceClass {
           console.log(
             `✅ Returning cached inventory: ${cached.currentStock}L, ${cached.transactions.length} transactions`
           );
+          this.connectionStatus.lastDataFetch!.inventory =
+            new Date().toISOString();
+          this.setLoadingState(
+            false,
+            "inventory",
+            `Loaded inventory: ${cached.currentStock.toFixed(1)}L`
+          );
           return cached;
         } else if (this.connectionStatus.hasRealData) {
           console.log("⚠️ No cached inventory but should have real data");
+          this.setLoadingState(false, "inventory", "No cached data available");
           return { currentStock: 0, transactions: [] };
         } else {
           console.log("🎭 No cached data, returning demo inventory");
+          this.setLoadingState(
+            false,
+            "inventory",
+            "Loaded demo inventory: 475.0L"
+          );
           return { currentStock: 475, transactions: [] };
         }
       }
 
       console.log("📡 Fetching inventory from backend...");
+      this.setLoadingState(true, "inventory", "Connecting to server...", 25);
+
       const response = await this.makeRequest<{
         currentStock: number;
         transactions: InventoryEntry[];
       }>(
         `${CONFIG.APPS_SCRIPT_URL}?action=getInventory&timestamp=${Date.now()}`
+      );
+
+      this.setLoadingState(
+        true,
+        "inventory",
+        "Processing inventory data...",
+        75
       );
 
       if (response.success) {
@@ -833,18 +1183,31 @@ class DieselServiceClass {
 
         // Mark that we have real data
         this.connectionStatus.hasRealData = true;
+        this.connectionStatus.lastDataFetch!.inventory =
+          new Date().toISOString();
         await this.cacheData(STORAGE_KEYS.HAS_REAL_DATA, true);
         await this.cacheData(
           STORAGE_KEYS.CONNECTION_STATUS,
           this.connectionStatus
         );
 
+        this.setLoadingState(
+          false,
+          "inventory",
+          `Loaded inventory: ${inventoryData.currentStock.toFixed(1)}L`
+        );
         return inventoryData;
       } else {
         throw new Error(response.message || "Failed to fetch inventory");
       }
     } catch (error) {
       console.error("❌ Error fetching inventory:", error);
+      this.setLoadingState(
+        true,
+        "inventory",
+        "Server error, checking cache...",
+        60
+      );
 
       // Return cached data
       const cached = await this.getCachedData<{
@@ -854,6 +1217,13 @@ class DieselServiceClass {
 
       if (cached) {
         console.log(`📱 Fallback to cached inventory: ${cached.currentStock}L`);
+        this.setLoadingState(
+          false,
+          "inventory",
+          `Loaded cached inventory: ${cached.currentStock.toFixed(
+            1
+          )}L (offline)`
+        );
         return cached;
       }
 
@@ -862,10 +1232,16 @@ class DieselServiceClass {
         console.log(
           "🎭 Fallback to demo inventory (no real data ever fetched)"
         );
+        this.setLoadingState(
+          false,
+          "inventory",
+          "Loaded demo inventory: 475.0L (first time)"
+        );
         return { currentStock: 475, transactions: [] };
       }
 
       console.log("📭 No inventory data available");
+      this.setLoadingState(false, "inventory", "No data available");
       return { currentStock: 0, transactions: [] };
     }
   }
@@ -876,6 +1252,8 @@ class DieselServiceClass {
     machineName?: string;
     ownership?: string;
   }): Promise<{ logs: DieselEntry[]; success: boolean }> {
+    this.setLoadingState(true, "logs", "Loading logs data...");
+
     try {
       console.log(
         `📊 Getting logs... (Connected: ${this.connectionStatus.isConnected}, Internet: ${this.connectionStatus.isInternetReachable})`
@@ -886,23 +1264,40 @@ class DieselServiceClass {
         !this.connectionStatus.isInternetReachable
       ) {
         console.log("📱 Using cached/offline logs data");
+        this.setLoadingState(true, "logs", "Loading from cache...", 50);
+
         const cached = await this.getCachedData<DieselEntry[]>(
           STORAGE_KEYS.LOGS
         );
 
         if (cached && cached.length > 0) {
           console.log(`✅ Returning ${cached.length} cached logs`);
+          this.connectionStatus.lastDataFetch!.logs = new Date().toISOString();
+          this.setLoadingState(
+            false,
+            "logs",
+            `Loaded ${cached.length} logs from cache`
+          );
           return { logs: cached, success: true };
         } else if (this.connectionStatus.hasRealData) {
           console.log("⚠️ No cached logs but should have real data");
+          this.setLoadingState(false, "logs", "No cached data available");
           return { logs: [], success: true };
         } else {
           console.log("🎭 No cached data, returning demo logs");
-          return { logs: this.getMockLogs(), success: true };
+          const mockLogs = this.getMockLogs();
+          this.setLoadingState(
+            false,
+            "logs",
+            `Loaded ${mockLogs.length} demo logs`
+          );
+          return { logs: mockLogs, success: true };
         }
       }
 
       console.log("📡 Fetching logs from backend...");
+      this.setLoadingState(true, "logs", "Preparing request...", 20);
+
       let url = `${
         CONFIG.APPS_SCRIPT_URL
       }?action=getLogsEnhanced&timestamp=${Date.now()}`;
@@ -916,7 +1311,10 @@ class DieselServiceClass {
           url += `&ownership=${encodeURIComponent(filters.ownership)}`;
       }
 
+      this.setLoadingState(true, "logs", "Connecting to server...", 40);
       const response = await this.makeRequest<{ logs: DieselEntry[] }>(url);
+
+      this.setLoadingState(true, "logs", "Processing logs...", 80);
 
       if (response.success && response.logs) {
         console.log(`✅ Fetched ${response.logs.length} logs from backend`);
@@ -926,38 +1324,59 @@ class DieselServiceClass {
 
         // Mark that we have real data
         this.connectionStatus.hasRealData = true;
+        this.connectionStatus.lastDataFetch!.logs = new Date().toISOString();
         await this.cacheData(STORAGE_KEYS.HAS_REAL_DATA, true);
         await this.cacheData(
           STORAGE_KEYS.CONNECTION_STATUS,
           this.connectionStatus
         );
 
+        this.setLoadingState(
+          false,
+          "logs",
+          `Loaded ${response.logs.length} logs from server`
+        );
         return { logs: response.logs, success: true };
       } else {
         throw new Error(response.message || "Failed to fetch logs");
       }
     } catch (error) {
       console.error("❌ Error fetching logs:", error);
+      this.setLoadingState(true, "logs", "Server error, checking cache...", 60);
 
       // Return cached data
       const cached = await this.getCachedData<DieselEntry[]>(STORAGE_KEYS.LOGS);
       if (cached && cached.length > 0) {
         console.log(`📱 Fallback to ${cached.length} cached logs`);
+        this.setLoadingState(
+          false,
+          "logs",
+          `Loaded ${cached.length} logs from cache (offline)`
+        );
         return { logs: cached, success: false };
       }
 
       // Only return mock data if we've never had real data
       if (!this.connectionStatus.hasRealData) {
         console.log("🎭 Fallback to demo logs (no real data ever fetched)");
-        return { logs: this.getMockLogs(), success: false };
+        const mockLogs = this.getMockLogs();
+        this.setLoadingState(
+          false,
+          "logs",
+          `Loaded ${mockLogs.length} demo logs (first time)`
+        );
+        return { logs: mockLogs, success: false };
       }
 
       console.log("📭 No logs available");
+      this.setLoadingState(false, "logs", "No data available");
       return { logs: [], success: false };
     }
   }
 
   async getAlertsData(): Promise<{ alerts: AlertData; success: boolean }> {
+    this.setLoadingState(true, "alerts", "Loading alerts data...");
+
     try {
       console.log(
         `🚨 Getting alerts... (Connected: ${this.connectionStatus.isConnected}, Internet: ${this.connectionStatus.isInternetReachable})`
@@ -968,21 +1387,35 @@ class DieselServiceClass {
         !this.connectionStatus.isInternetReachable
       ) {
         console.log("📱 Using cached/offline alerts data");
+        this.setLoadingState(true, "alerts", "Loading from cache...", 50);
+
         const cached = await this.getCachedData<AlertData>(
           "@diesel_tracker:alerts"
         );
 
         if (cached) {
           console.log(`✅ Returning cached alerts`);
+          this.connectionStatus.lastDataFetch!.alerts =
+            new Date().toISOString();
+          const totalAlerts =
+            (cached.overConsumption?.length || 0) +
+            (cached.idleMachines?.length || 0);
+          this.setLoadingState(
+            false,
+            "alerts",
+            `Loaded ${totalAlerts} alerts from cache`
+          );
           return { alerts: cached, success: true };
         } else if (this.connectionStatus.hasRealData) {
           console.log("⚠️ No cached alerts but should have real data");
+          this.setLoadingState(false, "alerts", "No cached data available");
           return {
             alerts: { overConsumption: [], idleMachines: [] },
             success: true,
           };
         } else {
           console.log("🎭 No cached data, returning demo alerts");
+          this.setLoadingState(false, "alerts", "Loaded demo alerts");
           return {
             alerts: { overConsumption: [], idleMachines: [] },
             success: true,
@@ -991,9 +1424,13 @@ class DieselServiceClass {
       }
 
       console.log("📡 Fetching alerts from backend...");
+      this.setLoadingState(true, "alerts", "Connecting to server...", 30);
+
       const response = await this.makeRequest<{ alerts: AlertData }>(
         `${CONFIG.APPS_SCRIPT_URL}?action=getAlertsData&timestamp=${Date.now()}`
       );
+
+      this.setLoadingState(true, "alerts", "Processing alerts...", 70);
 
       if (response.success) {
         const alertsData = response.alerts || {
@@ -1006,27 +1443,51 @@ class DieselServiceClass {
 
         // Mark that we have real data
         this.connectionStatus.hasRealData = true;
+        this.connectionStatus.lastDataFetch!.alerts = new Date().toISOString();
         await this.cacheData(STORAGE_KEYS.HAS_REAL_DATA, true);
         await this.cacheData(
           STORAGE_KEYS.CONNECTION_STATUS,
           this.connectionStatus
         );
 
+        const totalAlerts =
+          (alertsData.overConsumption?.length || 0) +
+          (alertsData.idleMachines?.length || 0);
+        this.setLoadingState(
+          false,
+          "alerts",
+          `Loaded ${totalAlerts} alerts from server`
+        );
         return { alerts: alertsData, success: true };
       } else {
         throw new Error(response.message || "Failed to fetch alerts data");
       }
     } catch (error) {
       console.error("❌ Error fetching alerts:", error);
+      this.setLoadingState(
+        true,
+        "alerts",
+        "Server error, checking cache...",
+        60
+      );
 
       // Return cached data
       const cached = await this.getCachedData<AlertData>(
         "@diesel_tracker:alerts"
       );
       if (cached) {
+        const totalAlerts =
+          (cached.overConsumption?.length || 0) +
+          (cached.idleMachines?.length || 0);
+        this.setLoadingState(
+          false,
+          "alerts",
+          `Loaded ${totalAlerts} alerts from cache (offline)`
+        );
         return { alerts: cached, success: false };
       }
 
+      this.setLoadingState(false, "alerts", "No data available");
       return {
         alerts: { overConsumption: [], idleMachines: [] },
         success: false,
@@ -1495,9 +1956,17 @@ class DieselServiceClass {
 
   // Enhanced submission methods with immediate local updates and queue management
   async submitEntry(entry: DieselEntry): Promise<ApiResponse> {
+    this.setLoadingState(true, "submitEntry", "Preparing diesel entry...");
     console.log("📝 Submitting diesel entry...");
 
     try {
+      this.setLoadingState(
+        true,
+        "submitEntry",
+        "Calculating usage and rate...",
+        20
+      );
+
       // Calculate additional fields
       const usage = entry.endReading - entry.startReading;
       const machine = (await this.getMachines()).find(
@@ -1523,6 +1992,8 @@ class DieselServiceClass {
         createdAt: entry.createdAt || new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
+
+      this.setLoadingState(true, "submitEntry", "Updating local cache...", 40);
 
       // Update local cache immediately for better UX
       const logs =
@@ -1553,6 +2024,12 @@ class DieselServiceClass {
         // Try to submit immediately
         try {
           console.log("📡 Attempting immediate submission...");
+          this.setLoadingState(
+            true,
+            "submitEntry",
+            "Submitting to server...",
+            70
+          );
 
           const response = await this.makeRequest(CONFIG.APPS_SCRIPT_URL, {
             method: "POST",
@@ -1565,6 +2042,11 @@ class DieselServiceClass {
 
           if (response.success) {
             console.log("✅ Entry submitted successfully!");
+            this.setLoadingState(
+              false,
+              "submitEntry",
+              "Entry submitted successfully!"
+            );
             return {
               success: true,
               message: "Entry submitted successfully!",
@@ -1577,8 +2059,21 @@ class DieselServiceClass {
             "⚠️ Immediate submission failed, queuing for later:",
             error
           );
+          this.setLoadingState(
+            true,
+            "submitEntry",
+            "Server unavailable, queuing...",
+            85
+          );
           // Fall through to queue the entry
         }
+      } else {
+        this.setLoadingState(
+          true,
+          "submitEntry",
+          "No connection, queuing for later...",
+          80
+        );
       }
 
       // Queue for later submission
@@ -1589,6 +2084,12 @@ class DieselServiceClass {
       ); // High priority
       console.log(`📦 Entry queued with ID: ${queueId}`);
 
+      this.setLoadingState(
+        false,
+        "submitEntry",
+        "Entry saved locally and queued"
+      );
+
       return {
         success: true,
         message: this.connectionStatus.isInternetReachable
@@ -1597,6 +2098,7 @@ class DieselServiceClass {
       };
     } catch (error) {
       console.error("💥 Error submitting entry:", error);
+      this.setLoadingState(false, "submitEntry", "Submission failed");
       return {
         success: false,
         message: `Failed to submit entry: ${
@@ -1607,9 +2109,17 @@ class DieselServiceClass {
   }
 
   async addInventory(inventory: InventoryEntry): Promise<ApiResponse> {
+    this.setLoadingState(true, "addInventory", "Adding inventory...");
     console.log("📦 Adding inventory...");
 
     try {
+      this.setLoadingState(
+        true,
+        "addInventory",
+        "Processing inventory data...",
+        20
+      );
+
       const inventoryWithMeta = {
         ...inventory,
         id:
@@ -1620,6 +2130,13 @@ class DieselServiceClass {
         createdAt: inventory.createdAt || new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
+
+      this.setLoadingState(
+        true,
+        "addInventory",
+        "Updating local inventory...",
+        40
+      );
 
       // Update local cache immediately
       const currentInventory = await this.getInventory();
@@ -1639,6 +2156,12 @@ class DieselServiceClass {
         // Try to submit immediately
         try {
           console.log("📡 Attempting immediate inventory submission...");
+          this.setLoadingState(
+            true,
+            "addInventory",
+            "Submitting to server...",
+            70
+          );
 
           const params = new URLSearchParams({
             action: "addInventory",
@@ -1656,6 +2179,11 @@ class DieselServiceClass {
 
           if (response.success) {
             console.log("✅ Inventory added successfully!");
+            this.setLoadingState(
+              false,
+              "addInventory",
+              "Inventory added successfully!"
+            );
             return {
               success: true,
               message: "Inventory added successfully!",
@@ -1668,8 +2196,21 @@ class DieselServiceClass {
             "⚠️ Immediate inventory submission failed, queuing for later:",
             error
           );
+          this.setLoadingState(
+            true,
+            "addInventory",
+            "Server unavailable, queuing...",
+            85
+          );
           // Fall through to queue the entry
         }
+      } else {
+        this.setLoadingState(
+          true,
+          "addInventory",
+          "No connection, queuing for later...",
+          80
+        );
       }
 
       // Queue for later submission
@@ -1680,6 +2221,12 @@ class DieselServiceClass {
       ); // High priority
       console.log(`📦 Inventory queued with ID: ${queueId}`);
 
+      this.setLoadingState(
+        false,
+        "addInventory",
+        "Inventory saved locally and queued"
+      );
+
       return {
         success: true,
         message: this.connectionStatus.isInternetReachable
@@ -1688,6 +2235,7 @@ class DieselServiceClass {
       };
     } catch (error) {
       console.error("💥 Error adding inventory:", error);
+      this.setLoadingState(false, "addInventory", "Failed to add inventory");
       return {
         success: false,
         message: `Failed to add inventory: ${
@@ -1700,44 +2248,34 @@ class DieselServiceClass {
   async addMachine(
     machine: Omit<Machine, "lastReading" | "id">
   ): Promise<ApiResponse> {
+    this.setLoadingState(true, "addMachine", "Adding new machine...");
     console.log("🏗️ Adding machine...");
 
     try {
-      // Validate required fields
+      this.setLoadingState(
+        true,
+        "addMachine",
+        "Validating machine data...",
+        10
+      );
+
+      // Validation with progress updates
       if (!machine.name?.trim()) {
-        return {
-          success: false,
-          message: "Machine name is required",
-        };
+        this.setLoadingState(false, "addMachine", "Validation failed");
+        return { success: false, message: "Machine name is required" };
       }
 
       if (!machine.plate?.trim()) {
-        return {
-          success: false,
-          message: "Plate number is required",
-        };
+        this.setLoadingState(false, "addMachine", "Validation failed");
+        return { success: false, message: "Plate number is required" };
       }
 
-      if (!machine.initialReading || machine.initialReading < 0) {
-        return {
-          success: false,
-          message: "Valid initial reading is required",
-        };
-      }
-
-      if (!machine.standardAvgDiesel || machine.standardAvgDiesel <= 0) {
-        return {
-          success: false,
-          message: "Valid standard average diesel consumption is required",
-        };
-      }
-
-      if (!machine.expectedDailyHours || machine.expectedDailyHours <= 0) {
-        return {
-          success: false,
-          message: "Valid expected daily hours is required",
-        };
-      }
+      this.setLoadingState(
+        true,
+        "addMachine",
+        "Checking for duplicates...",
+        25
+      );
 
       // Check for duplicates in local cache
       const existingMachines = await this.getMachines();
@@ -1749,6 +2287,7 @@ class DieselServiceClass {
       );
 
       if (duplicateName) {
+        this.setLoadingState(false, "addMachine", "Duplicate name found");
         return {
           success: false,
           message: `Machine with name "${machine.name}" already exists`,
@@ -1756,11 +2295,19 @@ class DieselServiceClass {
       }
 
       if (duplicatePlate) {
+        this.setLoadingState(false, "addMachine", "Duplicate plate found");
         return {
           success: false,
           message: `Machine with plate "${machine.plate}" already exists`,
         };
       }
+
+      this.setLoadingState(
+        true,
+        "addMachine",
+        "Creating machine record...",
+        50
+      );
 
       // Create machine with metadata
       const machineWithMeta: Machine = {
@@ -1778,6 +2325,8 @@ class DieselServiceClass {
         lastReading: machine.initialReading || 0,
       };
 
+      this.setLoadingState(true, "addMachine", "Updating local cache...", 60);
+
       // Update local cache immediately for better UX
       const machines = [...existingMachines, machineWithMeta];
       await this.cacheData(STORAGE_KEYS.MACHINES, machines);
@@ -1791,6 +2340,12 @@ class DieselServiceClass {
         // Try to submit immediately
         try {
           console.log("📡 Attempting immediate machine submission...");
+          this.setLoadingState(
+            true,
+            "addMachine",
+            "Submitting to server...",
+            80
+          );
 
           const params = new URLSearchParams({
             action: "addMachineEnhanced",
@@ -1813,6 +2368,11 @@ class DieselServiceClass {
 
           if (response.success) {
             console.log("✅ Machine added successfully to backend!");
+            this.setLoadingState(
+              false,
+              "addMachine",
+              "Machine added successfully!"
+            );
             return {
               success: true,
               message: "Machine added successfully!",
@@ -1828,13 +2388,32 @@ class DieselServiceClass {
             "⚠️ Immediate machine submission failed, queuing for later:",
             error
           );
+          this.setLoadingState(
+            true,
+            "addMachine",
+            "Server unavailable, queuing...",
+            90
+          );
           // Fall through to queue the entry
         }
+      } else {
+        this.setLoadingState(
+          true,
+          "addMachine",
+          "No connection, queuing for later...",
+          85
+        );
       }
 
       // Queue for later submission
       const queueId = await this.addToOfflineQueue("machine", machine, 3); // Medium priority
       console.log(`📦 Machine queued with ID: ${queueId}`);
+
+      this.setLoadingState(
+        false,
+        "addMachine",
+        "Machine saved locally and queued"
+      );
 
       return {
         success: true,
@@ -1847,6 +2426,7 @@ class DieselServiceClass {
       };
     } catch (error) {
       console.error("💥 Error adding machine:", error);
+      this.setLoadingState(false, "addMachine", "Failed to add machine");
       return {
         success: false,
         message: `Failed to add machine: ${
@@ -2515,4 +3095,4 @@ class DieselServiceClass {
 }
 
 // Export singleton instance
-export const DieselService = new DieselServiceClass();
+export const DieselService = new EnhancedDieselServiceClass();
