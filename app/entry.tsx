@@ -36,8 +36,14 @@ export default function DieselEntryScreen() {
   const [phoneNumber, setPhoneNumber] = useState<string>("");
   const [lastReading, setLastReading] = useState<string>("");
   const [currentReading, setCurrentReading] = useState<string>("");
-  const [confirmReading, setConfirmReading] = useState<string>(""); // New confirmation field
-  const [dieselFilled, setDieselFilled] = useState<string>("");
+  const [confirmReading, setConfirmReading] = useState<string>(""); // Confirmation field
+
+  // NEW: Dispenser reading fields
+  const [dispenserStartReading, setDispenserStartReading] =
+    useState<string>("");
+  const [dispenserEndReading, setDispenserEndReading] = useState<string>("");
+  const [dieselFilled, setDieselFilled] = useState<string>(""); // Auto-calculated
+
   const [remarks, setRemarks] = useState<string>("");
   const [usage, setUsage] = useState<string>("");
   const [rate, setRate] = useState<string>("");
@@ -55,9 +61,14 @@ export default function DieselEntryScreen() {
   // Validation state
   const [currentReadingError, setCurrentReadingError] = useState<string>("");
   const [confirmReadingError, setConfirmReadingError] = useState<string>("");
+  const [dispenserStartError, setDispenserStartError] = useState<string>("");
+  const [dispenserEndError, setDispenserEndError] = useState<string>("");
   const [isValidCurrentReading, setIsValidCurrentReading] = useState(true);
   const [isValidConfirmReading, setIsValidConfirmReading] = useState(true);
+  const [isValidDispenserStart, setIsValidDispenserStart] = useState(true);
+  const [isValidDispenserEnd, setIsValidDispenserEnd] = useState(true);
   const [readingsMatch, setReadingsMatch] = useState(true);
+  const [dispenserReadingsValid, setDispenserReadingsValid] = useState(true);
 
   useEffect(() => {
     loadData();
@@ -162,15 +173,22 @@ export default function DieselEntryScreen() {
         // Clear any previous calculations and validations
         setCurrentReading("");
         setConfirmReading("");
+        setDispenserStartReading("");
+        setDispenserEndReading("");
         setDieselFilled("");
         setUsage("");
         setRate("");
         setAlertMessage("");
         setCurrentReadingError("");
         setConfirmReadingError("");
+        setDispenserStartError("");
+        setDispenserEndError("");
         setIsValidCurrentReading(true);
         setIsValidConfirmReading(true);
+        setIsValidDispenserStart(true);
+        setIsValidDispenserEnd(true);
         setReadingsMatch(true);
+        setDispenserReadingsValid(true);
 
         Alert.alert(
           "QR Code Scanned ✅",
@@ -178,7 +196,7 @@ export default function DieselEntryScreen() {
             machine.machineType || "L/hr"
           }\nOwnership: ${
             machine.ownershipType || "Own"
-          }\n\nPlease enter the current reading twice for verification and diesel amount.`
+          }\n\nPlease enter:\n1. Current machine reading (twice for verification)\n2. Dispenser start and end readings\n3. Remarks/location`
         );
       } else {
         Alert.alert(
@@ -205,17 +223,16 @@ export default function DieselEntryScreen() {
     setScanned(false);
   };
 
+  // Validation functions
   const validateCurrentReading = (value: string, lastRead: number): boolean => {
     const currentRead = parseFloat(value);
 
-    // Allow empty or incomplete input during typing
     if (!value || value === "" || isNaN(currentRead)) {
       setCurrentReadingError("");
       setIsValidCurrentReading(true);
       return true;
     }
 
-    // Only validate when user has entered a complete number and moved to next field
     if (currentRead <= lastRead) {
       setCurrentReadingError(
         `Current reading (${currentRead}) must be greater than last reading (${lastRead})`
@@ -233,7 +250,6 @@ export default function DieselEntryScreen() {
     currentValue: string,
     confirmValue: string
   ): boolean => {
-    // Allow empty values during typing
     if (!currentValue || !confirmValue) {
       setConfirmReadingError("");
       setReadingsMatch(true);
@@ -243,14 +259,12 @@ export default function DieselEntryScreen() {
     const current = parseFloat(currentValue);
     const confirm = parseFloat(confirmValue);
 
-    // Check if both are valid numbers
     if (isNaN(current) || isNaN(confirm)) {
       setConfirmReadingError("");
       setReadingsMatch(true);
       return true;
     }
 
-    // Check if readings match
     if (current !== confirm) {
       setConfirmReadingError(
         "❌ Readings do not match! Please check both values."
@@ -261,6 +275,64 @@ export default function DieselEntryScreen() {
 
     setConfirmReadingError("✅ Readings match perfectly!");
     setReadingsMatch(true);
+    return true;
+  };
+
+  // NEW: Dispenser validation functions
+  const validateDispenserReadings = (
+    startValue: string,
+    endValue: string
+  ): boolean => {
+    if (!startValue || !endValue) {
+      setDispenserStartError("");
+      setDispenserEndError("");
+      setDispenserReadingsValid(true);
+      return true;
+    }
+
+    const start = parseFloat(startValue);
+    const end = parseFloat(endValue);
+
+    if (isNaN(start) || isNaN(end)) {
+      setDispenserStartError("");
+      setDispenserEndError("");
+      setDispenserReadingsValid(true);
+      return true;
+    }
+
+    if (start < 0) {
+      setDispenserStartError("Start reading cannot be negative");
+      setIsValidDispenserStart(false);
+      setDispenserReadingsValid(false);
+      return false;
+    }
+
+    if (end < 0) {
+      setDispenserEndError("End reading cannot be negative");
+      setIsValidDispenserEnd(false);
+      setDispenserReadingsValid(false);
+      return false;
+    }
+
+    if (end <= start) {
+      setDispenserEndError(
+        `End reading (${end}) must be greater than start reading (${start})`
+      );
+      setIsValidDispenserEnd(false);
+      setDispenserReadingsValid(false);
+      return false;
+    }
+
+    // Calculate diesel filled
+    const dieselAmount = end - start;
+    setDieselFilled(dieselAmount.toFixed(2));
+
+    setDispenserStartError("");
+    setDispenserEndError("");
+    setIsValidDispenserStart(true);
+    setIsValidDispenserEnd(true);
+    setDispenserReadingsValid(true);
+
     return true;
   };
 
@@ -294,6 +366,7 @@ export default function DieselEntryScreen() {
     }
   };
 
+  // Event handlers
   const handleCurrentReadingChange = (value: string) => {
     setCurrentReading(value);
     const currentRead = parseFloat(value) || 0;
@@ -343,29 +416,52 @@ export default function DieselEntryScreen() {
   };
 
   const handleConfirmReadingBlur = () => {
-    // Validate readings match when confirm field loses focus
     validateReadingsMatch(currentReading, confirmReading);
   };
 
-  const handleDieselFilledChange = (value: string) => {
-    setDieselFilled(value);
-    const diesel = parseFloat(value) || 0;
+  // NEW: Dispenser reading handlers
+  const handleDispenserStartChange = (value: string) => {
+    setDispenserStartReading(value);
 
-    if (diesel > currentBalance) {
-      Alert.alert(
-        "Insufficient Stock",
-        `Requested diesel (${diesel}L) exceeds current stock (${currentBalance}L).`
-      );
+    // Validate and calculate if both readings are present
+    if (dispenserEndReading) {
+      const isValid = validateDispenserReadings(value, dispenserEndReading);
+      if (isValid) {
+        // Recalculate usage and rate with new diesel amount
+        const currentRead = parseFloat(confirmReading || currentReading) || 0;
+        const lastRead = parseFloat(lastReading) || 0;
+        const diesel = parseFloat(dieselFilled) || 0;
+        calculateUsageAndRate(lastRead, currentRead, diesel);
+      }
     }
+  };
 
-    // Use confirmed reading if available and matches, otherwise use current reading
-    const readingToUse =
-      readingsMatch && confirmReading
-        ? parseFloat(confirmReading)
-        : parseFloat(currentReading);
-    const currentRead = readingToUse || 0;
-    const lastRead = parseFloat(lastReading) || 0;
-    calculateUsageAndRate(lastRead, currentRead, diesel);
+  const handleDispenserEndChange = (value: string) => {
+    setDispenserEndReading(value);
+
+    // Validate and calculate if both readings are present
+    if (dispenserStartReading) {
+      const isValid = validateDispenserReadings(dispenserStartReading, value);
+      if (isValid) {
+        // Recalculate usage and rate with new diesel amount
+        const currentRead = parseFloat(confirmReading || currentReading) || 0;
+        const lastRead = parseFloat(lastReading) || 0;
+        const diesel = parseFloat(dieselFilled) || 0;
+        calculateUsageAndRate(lastRead, currentRead, diesel);
+      }
+    }
+  };
+
+  const handleDispenserStartBlur = () => {
+    if (dispenserStartReading && dispenserEndReading) {
+      validateDispenserReadings(dispenserStartReading, dispenserEndReading);
+    }
+  };
+
+  const handleDispenserEndBlur = () => {
+    if (dispenserStartReading && dispenserEndReading) {
+      validateDispenserReadings(dispenserStartReading, dispenserEndReading);
+    }
   };
 
   const checkForAlerts = (
@@ -467,8 +563,31 @@ export default function DieselEntryScreen() {
       return false;
     }
 
-    if (!dieselFilled || parseFloat(dieselFilled) <= 0) {
-      Alert.alert("Error", "Please enter diesel filled amount");
+    // NEW: Validate dispenser readings
+    const dispenserStart = parseFloat(dispenserStartReading);
+    const dispenserEnd = parseFloat(dispenserEndReading);
+
+    if (!dispenserStartReading || isNaN(dispenserStart)) {
+      Alert.alert("Error", "Please enter dispenser start reading");
+      return false;
+    }
+
+    if (!dispenserEndReading || isNaN(dispenserEnd)) {
+      Alert.alert("Error", "Please enter dispenser end reading");
+      return false;
+    }
+
+    if (dispenserEnd <= dispenserStart) {
+      Alert.alert(
+        "Error",
+        `Dispenser end reading (${dispenserEnd}) must be greater than start reading (${dispenserStart})`
+      );
+      return false;
+    }
+
+    const calculatedDiesel = dispenserEnd - dispenserStart;
+    if (calculatedDiesel <= 0) {
+      Alert.alert("Error", "Calculated diesel amount must be greater than 0");
       return false;
     }
 
@@ -490,10 +609,13 @@ export default function DieselEntryScreen() {
         machineName: selectedMachine,
         startReading: parseFloat(lastReading) || 0,
         endReading: parseFloat(confirmReading) || 0, // Use confirmed reading
-        dieselFilled: parseFloat(dieselFilled) || 0,
+        dieselFilled: parseFloat(dieselFilled) || 0, // Auto-calculated from dispenser readings
         remarks: remarks,
         phoneNumber: phoneNumber.replace(/\D/g, ""),
         imageURL: imageUri || "",
+        // NEW: Add dispenser readings to the data
+        dispenserStartReading: parseFloat(dispenserStartReading) || 0,
+        dispenserEndReading: parseFloat(dispenserEndReading) || 0,
       };
 
       const result = await DieselService.submitEntry(entryData);
@@ -530,6 +652,8 @@ export default function DieselEntryScreen() {
     setLastReading("");
     setCurrentReading("");
     setConfirmReading("");
+    setDispenserStartReading("");
+    setDispenserEndReading("");
     setDieselFilled("");
     setRemarks("");
     setUsage("");
@@ -537,12 +661,16 @@ export default function DieselEntryScreen() {
     setSelectedMachineData(null);
     setImageUri("");
     setAlertMessage("");
-    // Keep QR mode as default - don't reset to false
     setCurrentReadingError("");
     setConfirmReadingError("");
+    setDispenserStartError("");
+    setDispenserEndError("");
     setIsValidCurrentReading(true);
     setIsValidConfirmReading(true);
+    setIsValidDispenserStart(true);
+    setIsValidDispenserEnd(true);
     setReadingsMatch(true);
+    setDispenserReadingsValid(true);
   };
 
   const pickImage = async () => {
@@ -835,9 +963,9 @@ export default function DieselEntryScreen() {
           </Text>
         </View>
 
-        {/* Enhanced Readings Section with Verification */}
+        {/* Enhanced Machine Readings Section */}
         <View style={styles.readingsSection}>
-          <Text style={styles.sectionTitle}>📊 Engine/KM Readings</Text>
+          <Text style={styles.sectionTitle}>📊 Machine Readings</Text>
 
           {/* Last Reading */}
           <View style={styles.formGroup}>
@@ -912,20 +1040,79 @@ export default function DieselEntryScreen() {
           </View>
         </View>
 
-        {/* Diesel and Usage */}
-        <View style={styles.formRow}>
-          <View style={[styles.formGroup, { flex: 1, marginRight: 10 }]}>
-            <Text style={styles.label}>Diesel Filled (Liters) *</Text>
+        {/* NEW: Dispenser Readings Section */}
+        <View style={styles.dispenserSection}>
+          <Text style={styles.sectionTitle}>⛽ Diesel Dispenser Readings</Text>
+
+          {/* Dispenser Start Reading */}
+          <View style={styles.formGroup}>
+            <Text style={styles.label}>Dispenser Start Reading *</Text>
             <TextInput
-              style={styles.input}
-              value={dieselFilled}
-              onChangeText={handleDieselFilledChange}
-              placeholder="Enter diesel amount"
+              style={[
+                styles.input,
+                !isValidDispenserStart && styles.inputError,
+              ]}
+              value={dispenserStartReading}
+              onChangeText={handleDispenserStartChange}
+              onBlur={handleDispenserStartBlur}
+              placeholder="Enter dispenser start reading"
               keyboardType="numeric"
             />
+            {dispenserStartError ? (
+              <Text style={styles.errorText}>{dispenserStartError}</Text>
+            ) : null}
           </View>
 
-          <View style={[styles.formGroup, { flex: 1, marginLeft: 10 }]}>
+          {/* Dispenser End Reading */}
+          <View style={styles.formGroup}>
+            <Text style={styles.label}>Dispenser End Reading *</Text>
+            <TextInput
+              style={[
+                styles.input,
+                !isValidDispenserEnd && styles.inputError,
+                dispenserReadingsValid &&
+                  dispenserEndReading &&
+                  dispenserStartReading &&
+                  styles.inputSuccess,
+              ]}
+              value={dispenserEndReading}
+              onChangeText={handleDispenserEndChange}
+              onBlur={handleDispenserEndBlur}
+              placeholder="Enter dispenser end reading"
+              keyboardType="numeric"
+            />
+            {dispenserEndError ? (
+              <Text style={styles.errorText}>{dispenserEndError}</Text>
+            ) : null}
+          </View>
+
+          {/* Auto-calculated Diesel Filled (Read-only) */}
+          <View style={styles.formGroup}>
+            <Text style={styles.label}>
+              Diesel Filled (Liters) - Auto Calculated
+            </Text>
+            <TextInput
+              style={[
+                styles.input,
+                styles.readonlyInput,
+                styles.calculatedInput,
+              ]}
+              value={dieselFilled}
+              editable={false}
+              placeholder="Will calculate automatically"
+            />
+            {dieselFilled && (
+              <Text style={styles.calculationNote}>
+                ✅ Calculated: {dispenserEndReading} - {dispenserStartReading} ={" "}
+                {dieselFilled}L
+              </Text>
+            )}
+          </View>
+        </View>
+
+        {/* Usage and Rate */}
+        <View style={styles.formRow}>
+          <View style={[styles.formGroup, { flex: 1, marginRight: 10 }]}>
             <Text style={styles.label}>
               {selectedMachineData?.machineType === "KM/l"
                 ? "Kilometers Traveled"
@@ -937,11 +1124,8 @@ export default function DieselEntryScreen() {
               editable={false}
             />
           </View>
-        </View>
 
-        {/* Rate and Remarks */}
-        <View style={styles.formRow}>
-          <View style={[styles.formGroup, { flex: 1, marginRight: 10 }]}>
+          <View style={[styles.formGroup, { flex: 1, marginLeft: 10 }]}>
             <Text style={styles.label}>
               {selectedMachineData?.machineType === "KM/l"
                 ? "KM/l Rate"
@@ -953,16 +1137,17 @@ export default function DieselEntryScreen() {
               editable={false}
             />
           </View>
+        </View>
 
-          <View style={[styles.formGroup, { flex: 1, marginLeft: 10 }]}>
-            <Text style={styles.label}>Remarks/Chainage *</Text>
-            <TextInput
-              style={styles.input}
-              value={remarks}
-              onChangeText={setRemarks}
-              placeholder="At which chainage/location?"
-            />
-          </View>
+        {/* Remarks */}
+        <View style={styles.formGroup}>
+          <Text style={styles.label}>Remarks/Chainage *</Text>
+          <TextInput
+            style={styles.input}
+            value={remarks}
+            onChangeText={setRemarks}
+            placeholder="At which chainage/location?"
+          />
         </View>
 
         {/* Alert Warning */}
@@ -1010,14 +1195,19 @@ export default function DieselEntryScreen() {
             styles.submitButton,
             {
               backgroundColor:
-                currentBalance <= 0 || !readingsMatch
+                currentBalance <= 0 || !readingsMatch || !dispenserReadingsValid
                   ? "#6c757d"
                   : Colors[colorScheme ?? "light"].tint,
               opacity: loading ? 0.7 : 1,
             },
           ]}
           onPress={handleSubmit}
-          disabled={loading || currentBalance <= 0 || !readingsMatch}
+          disabled={
+            loading ||
+            currentBalance <= 0 ||
+            !readingsMatch ||
+            !dispenserReadingsValid
+          }
         >
           <Text style={styles.submitButtonText}>
             {loading
@@ -1025,7 +1215,9 @@ export default function DieselEntryScreen() {
               : currentBalance <= 0
               ? "No Diesel Available"
               : !readingsMatch
-              ? "Verify Readings First"
+              ? "Verify Machine Readings First"
+              : !dispenserReadingsValid
+              ? "Check Dispenser Readings"
               : "Submit Entry"}
           </Text>
         </TouchableOpacity>
@@ -1117,6 +1309,27 @@ const styles = StyleSheet.create({
     marginBottom: 20,
     borderLeftWidth: 4,
     borderLeftColor: "#007bff",
+  },
+  // NEW: Dispenser section styles
+  dispenserSection: {
+    backgroundColor: "#fff8e1",
+    borderRadius: 12,
+    padding: 15,
+    marginBottom: 20,
+    borderLeftWidth: 4,
+    borderLeftColor: "#ff9800",
+  },
+  calculatedInput: {
+    backgroundColor: "#e8f5e8",
+    borderColor: "#28a745",
+    color: "#28a745",
+    fontWeight: "bold",
+  },
+  calculationNote: {
+    fontSize: 12,
+    color: "#28a745",
+    marginTop: 5,
+    fontStyle: "italic",
   },
   sectionTitle: {
     fontSize: 16,
