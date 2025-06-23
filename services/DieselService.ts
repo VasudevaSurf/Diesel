@@ -1,5 +1,6 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import * as Network from "expo-network";
+import NetInfo from "@react-native-community/netinfo";
 
 // Configuration
 const CONFIG = {
@@ -7,12 +8,12 @@ const CONFIG = {
     "https://script.google.com/macros/s/AKfycbxtBrJY5SPUFtZv5cXu65SUSy7wyAIVHx6zYEtGG7pWu82JwrRegUWvw8LGBeSAo7DY/exec",
   ADMIN_PASSWORD: "admin123",
   INVENTORY_PASSWORD: "inventory456",
-  TIMEOUT: 15000, // Reduced to 15 seconds for better UX
+  TIMEOUT: 10000, // 10 seconds
   RETRY_ATTEMPTS: 3,
   CACHE_DURATION: 5 * 60 * 1000, // 5 minutes
   SYNC_INTERVAL: 30000, // 30 seconds
-  CONNECTION_CHECK_INTERVAL: 10000, // 10 seconds
-  PING_CHECK_INTERVAL: 5000, // 5 seconds for quick ping checks
+  CONNECTION_CHECK_INTERVAL: 3000, // 3 seconds
+  PING_CHECK_INTERVAL: 1000, // 1 second for very fast detection
 };
 
 // Storage Keys
@@ -27,9 +28,14 @@ const STORAGE_KEYS = {
   PENDING_ENTRIES: "@diesel_tracker:pending_entries",
   PENDING_INVENTORY: "@diesel_tracker:pending_inventory",
   PENDING_MACHINES: "@diesel_tracker:pending_machines",
+  CACHED_DATA_TIMESTAMP: "@diesel_tracker:cached_data_timestamp",
+  HAS_REAL_DATA: "@diesel_tracker:has_real_data",
 };
 
 const DEBUG_MODE = __DEV__;
+
+// Global event listeners for real-time updates
+const connectionListeners: ((status: ConnectionStatus) => void)[] = [];
 
 // Types
 export interface Machine {
@@ -85,12 +91,18 @@ export interface InventoryEntry {
 
 export interface QueuedItem {
   id: string;
-  type: "entry" | "inventory" | "machine" | "machineUpdate";
+  type:
+    | "entry"
+    | "inventory"
+    | "machine"
+    | "machineUpdate"
+    | "machineDelete"
+    | "alertUpdate";
   data: any;
   timestamp: string;
   retryCount: number;
   maxRetries: number;
-  priority: number; // Higher = more priority
+  priority: number;
 }
 
 export interface AlertData {
@@ -128,6 +140,9 @@ export interface ApiResponse<T = any> {
   imageURL?: string;
   error?: string;
   timestamp?: string;
+  hasLogs?: boolean;
+  requiresConfirmation?: boolean;
+  deletedMachine?: any;
 }
 
 export interface ConnectionStatus {
@@ -138,6 +153,7 @@ export interface ConnectionStatus {
   error?: string;
   networkType?: string;
   networkState?: string;
+  hasRealData: boolean;
 }
 
 export interface EnhancedAlertData {
@@ -208,29 +224,60 @@ class DieselServiceClass {
     isConnected: false,
     isInternetReachable: false,
     lastChecked: new Date().toISOString(),
+    hasRealData: false,
   };
 
   private offlineQueue: QueuedItem[] = [];
   private isProcessingQueue: boolean = false;
   private syncInterval: NodeJS.Timeout | null = null;
   private connectionCheckInterval: NodeJS.Timeout | null = null;
-  private quickPingInterval: NodeJS.Timeout | null = null;
+  private realTimeCheckInterval: NodeJS.Timeout | null = null;
+  private netInfoUnsubscribe: (() => void) | null = null;
   private lastNetworkState: any = null;
+  private isInitialized: boolean = false;
 
   constructor() {
     this.initializeService();
   }
 
-  // Initialize service with enhanced connection monitoring
+  // Add connection listener for real-time updates
+  addConnectionListener(
+    callback: (status: ConnectionStatus) => void
+  ): () => void {
+    connectionListeners.push(callback);
+    // Immediately call with current status
+    callback(this.connectionStatus);
+
+    // Return unsubscribe function
+    return () => {
+      const index = connectionListeners.indexOf(callback);
+      if (index > -1) {
+        connectionListeners.splice(index, 1);
+      }
+    };
+  }
+
+  // Notify all listeners of status changes
+  private notifyConnectionListeners(): void {
+    connectionListeners.forEach((listener) => {
+      try {
+        listener(this.connectionStatus);
+      } catch (error) {
+        console.error("Error in connection listener:", error);
+      }
+    });
+  }
+
+  // Enhanced initialization with immediate real-time monitoring
   private async initializeService(): Promise<void> {
     try {
-      console.log("🚀 Initializing DieselService...");
+      console.log("🚀 Initializing DieselService with real-time monitoring...");
 
-      // Load cached data
+      // Load cached data first
       await this.loadCachedData();
 
-      // Start network monitoring
-      this.startNetworkMonitoring();
+      // Start IMMEDIATE real-time network monitoring
+      this.startAggressiveNetworkMonitoring();
 
       // Start connection checking
       this.startConnectionChecking();
@@ -238,28 +285,37 @@ class DieselServiceClass {
       // Start auto-sync
       this.startAutoSync();
 
-      // Initial connection check
-      this.checkConnection();
+      // Initial connection check (non-blocking)
+      this.performInitialConnectionCheck();
 
-      console.log("✅ DieselService initialized successfully");
+      this.isInitialized = true;
+      console.log("✅ DieselService initialized with real-time monitoring");
     } catch (error) {
       console.error("❌ Failed to initialize service:", error);
+      this.isInitialized = true;
     }
   }
 
   private async loadCachedData(): Promise<void> {
     try {
-      // Load connection status
+      // Load connection status but always start as disconnected
       const cachedStatus = await this.getCachedData<ConnectionStatus>(
         STORAGE_KEYS.CONNECTION_STATUS
       );
       if (cachedStatus) {
-        this.connectionStatus = cachedStatus;
-        console.log(
-          "📱 Loaded cached connection status:",
-          this.connectionStatus
-        );
+        this.connectionStatus = {
+          ...cachedStatus,
+          isConnected: false, // Always start as disconnected until verified
+          isInternetReachable: false, // Will be updated by network monitoring
+          lastChecked: new Date().toISOString(),
+        };
       }
+
+      // Check if we have real data cached
+      const hasRealData = await this.getCachedData<boolean>(
+        STORAGE_KEYS.HAS_REAL_DATA
+      );
+      this.connectionStatus.hasRealData = hasRealData || false;
 
       // Load offline queue
       const cachedQueue = await this.getCachedData<QueuedItem[]>(
@@ -267,549 +323,285 @@ class DieselServiceClass {
       );
       if (cachedQueue) {
         this.offlineQueue = cachedQueue;
-        console.log(
-          `📦 Loaded offline queue with ${this.offlineQueue.length} items`
-        );
       }
+
+      console.log(
+        `💾 Loaded cache - Has real data: ${this.connectionStatus.hasRealData}, Queue: ${this.offlineQueue.length} items`
+      );
     } catch (error) {
       console.error("❌ Failed to load cached data:", error);
     }
   }
 
-  // Enhanced network monitoring using Expo Network
-  private startNetworkMonitoring(): void {
-    console.log("🌐 Starting network monitoring...");
+  // AGGRESSIVE real-time network monitoring with immediate updates
+  private startAggressiveNetworkMonitoring(): void {
+    console.log("🔥 Starting AGGRESSIVE real-time network monitoring...");
 
-    // Check network state periodically using a more aggressive approach
-    this.quickPingInterval = setInterval(async () => {
+    try {
+      // Primary monitoring with NetInfo (most reliable)
+      this.netInfoUnsubscribe = NetInfo.addEventListener((state) => {
+        console.log("🔄 IMMEDIATE Network change detected:", {
+          type: state.type,
+          isConnected: state.isConnected,
+          isInternetReachable: state.isInternetReachable,
+          timestamp: new Date().toISOString(),
+        });
+
+        this.handleNetworkStateChange(state);
+      });
+
+      // Also get immediate current state
+      NetInfo.fetch()
+        .then((state) => {
+          console.log("📡 Initial network state:", state);
+          this.handleNetworkStateChange(state);
+        })
+        .catch((error) => {
+          console.error("❌ Failed to get initial NetInfo state:", error);
+          this.fallbackToExpoNetworking();
+        });
+    } catch (error) {
+      console.error("❌ NetInfo setup failed, using fallback:", error);
+      this.fallbackToExpoNetworking();
+    }
+
+    // Ultra-fast backup monitoring for instant detection
+    this.realTimeCheckInterval = setInterval(async () => {
+      try {
+        // Quick network check with expo-network as backup
+        const expoState = await Network.getNetworkStateAsync();
+
+        if (
+          expoState.isInternetReachable !==
+          this.connectionStatus.isInternetReachable
+        ) {
+          console.log(
+            "⚡ BACKUP: Network state mismatch detected, updating..."
+          );
+          this.handleNetworkStateChange(expoState);
+        }
+      } catch (error) {
+        // Silent error - this is just backup monitoring
+      }
+    }, CONFIG.PING_CHECK_INTERVAL);
+  }
+
+  // Fallback method when NetInfo fails
+  private fallbackToExpoNetworking(): void {
+    console.log("🔄 Using Expo Network as primary monitoring...");
+
+    this.realTimeCheckInterval = setInterval(async () => {
       try {
         const networkState = await Network.getNetworkStateAsync();
 
-        // Check if network state changed
         const currentStateKey = `${networkState.type}_${networkState.isConnected}_${networkState.isInternetReachable}`;
         const lastStateKey = this.lastNetworkState
           ? `${this.lastNetworkState.type}_${this.lastNetworkState.isConnected}_${this.lastNetworkState.isInternetReachable}`
           : null;
 
         if (currentStateKey !== lastStateKey) {
-          console.log("🔄 Network state changed:", {
+          console.log("🔄 Network state changed (Expo):", {
             from: this.lastNetworkState,
             to: networkState,
+            timestamp: new Date().toISOString(),
           });
 
-          const wasInternetReachable =
-            this.connectionStatus.isInternetReachable;
-
-          this.connectionStatus = {
-            ...this.connectionStatus,
-            isInternetReachable: networkState.isInternetReachable ?? false,
-            networkType: networkState.type,
-            networkState: currentStateKey,
-            lastChecked: new Date().toISOString(),
-          };
-
-          // If internet was restored, check backend and process queue
-          if (!wasInternetReachable && networkState.isInternetReachable) {
-            console.log("🌟 Internet connection restored!");
-
-            // Check backend connection
-            setTimeout(() => {
-              this.checkBackendConnection().then((isBackendConnected) => {
-                if (isBackendConnected && this.offlineQueue.length > 0) {
-                  console.log(
-                    "⚡ Processing offline queue after connection restored..."
-                  );
-                  this.processOfflineQueue();
-                }
-              });
-            }, 1000); // Small delay to ensure connection is stable
-          }
-
-          // Cache the updated status
-          this.cacheData(STORAGE_KEYS.CONNECTION_STATUS, this.connectionStatus);
+          this.handleNetworkStateChange(networkState);
           this.lastNetworkState = networkState;
         }
       } catch (error) {
-        console.error("❌ Error checking network state:", error);
+        console.error("❌ Error in Expo network monitoring:", error);
       }
     }, CONFIG.PING_CHECK_INTERVAL);
   }
 
+  // Unified network state change handler
+  private handleNetworkStateChange(state: any): void {
+    const wasInternetReachable = this.connectionStatus.isInternetReachable;
+
+    // Update status IMMEDIATELY
+    this.connectionStatus = {
+      ...this.connectionStatus,
+      isInternetReachable: state.isInternetReachable ?? false,
+      networkType: state.type,
+      networkState: `${state.type}_${state.isConnected}_${state.isInternetReachable}`,
+      lastChecked: new Date().toISOString(),
+    };
+
+    // If internet connection changed
+    if (wasInternetReachable !== state.isInternetReachable) {
+      if (state.isInternetReachable) {
+        console.log("🌟 INTERNET RESTORED! Checking backend...");
+        // Remove any previous error
+        this.connectionStatus.error = undefined;
+
+        // Check backend connection IMMEDIATELY
+        setTimeout(() => {
+          this.checkBackendConnection().then((isBackendConnected) => {
+            if (isBackendConnected && this.offlineQueue.length > 0) {
+              console.log("⚡ Backend connected! Processing offline queue...");
+              this.processOfflineQueue();
+            }
+          });
+        }, 500); // Very short delay
+      } else {
+        console.log("❌ INTERNET LOST! Going offline...");
+        this.connectionStatus.isConnected = false;
+        this.connectionStatus.error = "No internet connection";
+      }
+    }
+
+    // IMMEDIATELY cache and notify listeners
+    this.cacheData(STORAGE_KEYS.CONNECTION_STATUS, this.connectionStatus);
+    this.notifyConnectionListeners();
+  }
+
   private startConnectionChecking(): void {
     this.connectionCheckInterval = setInterval(async () => {
+      // Only check backend if we have internet
       if (this.connectionStatus.isInternetReachable) {
-        await this.checkBackendConnection();
+        const wasConnected = this.connectionStatus.isConnected;
+        const isConnected = await this.checkBackendConnection();
+
+        // Notify listeners if connection status changed
+        if (wasConnected !== isConnected) {
+          this.notifyConnectionListeners();
+        }
+      } else {
+        // If no internet, ensure backend is marked as disconnected
+        if (this.connectionStatus.isConnected) {
+          this.connectionStatus.isConnected = false;
+          this.connectionStatus.error = "No internet connection";
+          this.cacheData(STORAGE_KEYS.CONNECTION_STATUS, this.connectionStatus);
+          this.notifyConnectionListeners();
+        }
       }
     }, CONFIG.CONNECTION_CHECK_INTERVAL);
   }
 
   private startAutoSync(): void {
     this.syncInterval = setInterval(async () => {
-      if (this.connectionStatus.isConnected && this.offlineQueue.length > 0) {
+      if (
+        this.connectionStatus.isConnected &&
+        this.connectionStatus.isInternetReachable &&
+        this.offlineQueue.length > 0
+      ) {
         console.log("🔄 Auto-sync: Processing offline queue...");
         await this.processOfflineQueue();
       }
     }, CONFIG.SYNC_INTERVAL);
   }
 
-  async getEnhancedAlertsData(): Promise<{
-    alerts: EnhancedAlertData;
-    success: boolean;
-  }> {
+  // Non-blocking initial connection check
+  private async performInitialConnectionCheck(): Promise<void> {
+    console.log("🔍 Performing initial connection check...");
+
     try {
-      if (!this.connectionStatus.isConnected) {
-        // Return mock data for offline mode
-        const mockAlerts = this.getMockEnhancedAlerts();
-        return { alerts: mockAlerts, success: true };
+      // Get current network state
+      let networkState;
+      try {
+        networkState = await NetInfo.fetch();
+      } catch (error) {
+        console.log("⚠️ NetInfo fetch failed, using Expo Network...");
+        networkState = await Network.getNetworkStateAsync();
       }
 
-      const response = await this.makeRequest<{ alerts: EnhancedAlertData }>(
-        `${CONFIG.APPS_SCRIPT_URL}?action=getAlertsData&timestamp=${Date.now()}`
-      );
+      console.log("📶 Initial network state:", networkState);
 
-      if (response.success && response.alerts) {
-        // Cache alerts data
-        await this.cacheData(
-          "@diesel_tracker:enhanced_alerts",
-          response.alerts
-        );
-        return { alerts: response.alerts, success: true };
-      } else {
-        throw new Error(response.message || "Failed to fetch enhanced alerts");
-      }
-    } catch (error) {
-      console.error("❌ Error fetching enhanced alerts:", error);
-
-      // Try to return cached data
-      const cached = await this.getCachedData<EnhancedAlertData>(
-        "@diesel_tracker:enhanced_alerts"
-      );
-      if (cached) {
-        return { alerts: cached, success: false };
-      }
-
-      // Return mock data as fallback
-      return { alerts: this.getMockEnhancedAlerts(), success: false };
-    }
-  }
-
-  async getMachinePerformanceAnalytics(): Promise<{
-    analytics: MachinePerformanceAnalytics[];
-    summary: any;
-    success: boolean;
-  }> {
-    try {
-      if (!this.connectionStatus.isConnected) {
-        return {
-          analytics: this.getMockPerformanceAnalytics(),
-          summary: this.getMockPerformanceSummary(),
-          success: true,
-        };
-      }
-
-      const response = await this.makeRequest<{
-        analytics: MachinePerformanceAnalytics[];
-        summary: any;
-      }>(
-        `${
-          CONFIG.APPS_SCRIPT_URL
-        }?action=getMachinePerformanceAnalytics&timestamp=${Date.now()}`
-      );
-
-      if (response.success) {
-        await this.cacheData("@diesel_tracker:performance_analytics", {
-          analytics: response.analytics,
-          summary: response.summary,
-        });
-
-        return {
-          analytics: response.analytics || [],
-          summary: response.summary || {},
-          success: true,
-        };
-      } else {
-        throw new Error(
-          response.message || "Failed to fetch performance analytics"
-        );
-      }
-    } catch (error) {
-      console.error("❌ Error fetching performance analytics:", error);
-
-      // Try cached data
-      const cached = await this.getCachedData<{
-        analytics: MachinePerformanceAnalytics[];
-        summary: any;
-      }>("@diesel_tracker:performance_analytics");
-
-      if (cached) {
-        return { ...cached, success: false };
-      }
-
-      return {
-        analytics: this.getMockPerformanceAnalytics(),
-        summary: this.getMockPerformanceSummary(),
-        success: false,
+      // Update status based on network state
+      this.connectionStatus = {
+        ...this.connectionStatus,
+        isInternetReachable: networkState.isInternetReachable ?? false,
+        networkType: networkState.type,
+        lastChecked: new Date().toISOString(),
       };
-    }
-  }
 
-  async updateAlertStatus(
-    alertId: string,
-    status: "acknowledged" | "resolved",
-    resolvedBy?: string,
-    comments?: string
-  ): Promise<ApiResponse> {
-    try {
-      if (!this.connectionStatus.isConnected) {
-        // For offline mode, just update local cache
-        const cached = await this.getCachedData<EnhancedAlertData>(
-          "@diesel_tracker:enhanced_alerts"
+      if (networkState.isInternetReachable) {
+        // Check backend connection
+        const isBackendConnected = await this.checkBackendConnection();
+        console.log(
+          `🔗 Initial backend check: ${
+            isBackendConnected ? "✅ Connected" : "❌ Failed"
+          }`
         );
-        if (cached) {
-          // Update status in all relevant arrays
-          const updateAlertInArray = (alerts: AlertItem[]) => {
-            const alert = alerts.find((a) => a.id === alertId);
-            if (alert) {
-              alert.status = status;
-            }
-          };
-
-          updateAlertInArray(cached.recent);
-          updateAlertInArray(cached.weekly);
-          updateAlertInArray(cached.monthly);
-          updateAlertInArray(cached.overConsumption);
-          updateAlertInArray(cached.lowEfficiency);
-          updateAlertInArray(cached.idleMachines);
-          updateAlertInArray(cached.underWorked);
-          updateAlertInArray(cached.maintenanceDue);
-          updateAlertInArray(cached.unusualPatterns);
-
-          await this.cacheData("@diesel_tracker:enhanced_alerts", cached);
-        }
-
-        // Queue for later sync
-        await this.addToOfflineQueue(
-          "alertUpdate",
-          {
-            alertId,
-            status,
-            resolvedBy,
-            comments,
-          },
-          2
-        );
-
-        return {
-          success: true,
-          message: `Alert ${status} locally. Will sync when online.`,
-        };
-      }
-
-      const response = await this.makeRequest(CONFIG.APPS_SCRIPT_URL, {
-        method: "POST",
-        body: JSON.stringify({
-          action: "updateAlertStatus",
-          alertId,
-          status,
-          resolvedBy,
-          comments,
-          timestamp: Date.now(),
-        }),
-      });
-
-      if (response.success) {
-        // Update local cache
-        const cached = await this.getCachedData<EnhancedAlertData>(
-          "@diesel_tracker:enhanced_alerts"
-        );
-        if (cached) {
-          // Update the alert status in cached data
-          const updateAlertInArray = (alerts: AlertItem[]) => {
-            const alert = alerts.find((a) => a.id === alertId);
-            if (alert) {
-              alert.status = status;
-            }
-          };
-
-          updateAlertInArray(cached.recent);
-          updateAlertInArray(cached.weekly);
-          updateAlertInArray(cached.monthly);
-          updateAlertInArray(cached.overConsumption);
-          updateAlertInArray(cached.lowEfficiency);
-          updateAlertInArray(cached.idleMachines);
-          updateAlertInArray(cached.underWorked);
-          updateAlertInArray(cached.maintenanceDue);
-          updateAlertInArray(cached.unusualPatterns);
-
-          await this.cacheData("@diesel_tracker:enhanced_alerts", cached);
-        }
-
-        return {
-          success: true,
-          message: `Alert ${status} successfully!`,
-        };
       } else {
-        throw new Error(response.message || "Failed to update alert status");
-      }
-    } catch (error) {
-      console.error("❌ Error updating alert status:", error);
-      return {
-        success: false,
-        message: `Failed to update alert status: ${
-          error instanceof Error ? error.message : "Unknown error"
-        }`,
-      };
-    }
-  }
-
-  /**
-   * Export alerts data
-   */
-  async exportAlertsData(): Promise<{ data: any; success: boolean }> {
-    try {
-      if (!this.connectionStatus.isConnected) {
-        // Generate export from cached data
-        const alerts = await this.getCachedData<EnhancedAlertData>(
-          "@diesel_tracker:enhanced_alerts"
-        );
-        const analytics = await this.getCachedData<{
-          analytics: MachinePerformanceAnalytics[];
-          summary: any;
-        }>("@diesel_tracker:performance_analytics");
-
-        return {
-          data: {
-            timestamp: new Date().toISOString(),
-            alerts: alerts || this.getMockEnhancedAlerts(),
-            analytics:
-              analytics?.analytics || this.getMockPerformanceAnalytics(),
-            summary: {
-              alerts: alerts?.summary || {
-                total: 0,
-                high: 0,
-                medium: 0,
-                low: 0,
-                critical: 0,
-              },
-              performance: analytics?.summary || {
-                totalMachines: 0,
-                highRisk: 0,
-                mediumRisk: 0,
-                lowRisk: 0,
-              },
-            },
-            metadata: {
-              version: "3.1",
-              exportedBy: "Diesel Tracker Pro (Offline)",
-              source: "cached-data",
-            },
-          },
-          success: true,
-        };
+        console.log("❌ No internet connection on startup");
+        this.connectionStatus.isConnected = false;
+        this.connectionStatus.error = "No internet connection";
       }
 
-      const response = await this.makeRequest<{ data: any }>(
-        `${
-          CONFIG.APPS_SCRIPT_URL
-        }?action=exportAlertsData&timestamp=${Date.now()}`
+      // Cache and notify
+      await this.cacheData(
+        STORAGE_KEYS.CONNECTION_STATUS,
+        this.connectionStatus
       );
-
-      if (response.success && response.data) {
-        return { data: response.data, success: true };
-      } else {
-        throw new Error(response.message || "Failed to export alerts data");
-      }
+      this.notifyConnectionListeners();
     } catch (error) {
-      console.error("❌ Error exporting alerts data:", error);
-      return {
-        data: null,
-        success: false,
+      console.error("❌ Initial connection check failed:", error);
+      this.connectionStatus = {
+        ...this.connectionStatus,
+        isConnected: false,
+        isInternetReachable: false,
+        error:
+          error instanceof Error ? error.message : "Connection check failed",
+        lastChecked: new Date().toISOString(),
       };
+      await this.cacheData(
+        STORAGE_KEYS.CONNECTION_STATUS,
+        this.connectionStatus
+      );
+      this.notifyConnectionListeners();
     }
   }
 
-  /**
-   * Generate mock enhanced alerts data for demo/offline mode
-   */
-  private getMockEnhancedAlerts(): EnhancedAlertData {
-    const now = new Date();
-    const mockAlerts: AlertItem[] = [
-      {
-        id: "alert_1",
-        timestamp: now.toISOString(),
-        machine: "JCB-12",
-        plate: "AP09AB1234",
-        alertType: "OVER_CONSUMPTION",
-        severity: "high",
-        standardValue: 4.0,
-        actualValue: 6.5,
-        mismatch: 2.5,
-        unit: "L/hr",
-        description: "Exceeded standard consumption by 2.5 L/hr",
-        machineType: "L/hr",
-        ownershipType: "Rental",
-        status: "active",
-        expectedHours: 8,
-        actualHours: 7.5,
-      },
-      {
-        id: "alert_2",
-        timestamp: new Date(now.getTime() - 2 * 60 * 60 * 1000).toISOString(),
-        machine: "CAT-09",
-        plate: "TN10CD5678",
-        alertType: "IDLE_MACHINE",
-        severity: "medium",
-        standardValue: 8.0,
-        actualValue: 5.5,
-        mismatch: -2.5,
-        unit: "hours",
-        description: "Machine was idle for 2.5 hours below expected",
-        machineType: "L/hr",
-        ownershipType: "Own",
-        status: "active",
-        expectedHours: 8,
-        actualHours: 5.5,
-      },
-      {
-        id: "alert_3",
-        timestamp: new Date(now.getTime() - 4 * 60 * 60 * 1000).toISOString(),
-        machine: "TRUCK-01",
-        plate: "KA20EF9012",
-        alertType: "UNDER_WORKED",
-        severity: "low",
-        standardValue: 10.0,
-        actualValue: 7.2,
-        mismatch: -2.8,
-        unit: "hours/day",
-        description:
-          "Machine under-utilized: averaging 7.2 hrs/day vs expected 10 hrs/day",
-        machineType: "KM/l",
-        ownershipType: "Own",
-        status: "active",
-        expectedHours: 10,
-        actualHours: 7.2,
-      },
-    ];
-
-    return {
-      recent: [mockAlerts[0]],
-      weekly: mockAlerts,
-      monthly: mockAlerts,
-      overConsumption: [mockAlerts[0]],
-      lowEfficiency: [],
-      idleMachines: [mockAlerts[1]],
-      underWorked: [mockAlerts[2]],
-      maintenanceDue: [],
-      unusualPatterns: [],
-      summary: {
-        total: 3,
-        high: 1,
-        medium: 1,
-        low: 1,
-        critical: 0,
-      },
-    };
-  }
-
-  /**
-   * Generate mock performance analytics
-   */
-  private getMockPerformanceAnalytics(): MachinePerformanceAnalytics[] {
-    return [
-      {
-        machine: "JCB-12",
-        plate: "AP09AB1234",
-        machineType: "L/hr",
-        ownershipType: "Rental",
-        totalEntries: 15,
-        avgDailyUsage: 7.5,
-        avgConsumptionRate: 6.2,
-        totalUsage: 112.5,
-        totalDiesel: 697.5,
-        efficiencyTrend: "declining",
-        alertRisk: "high",
-        recommendations: [
-          "Monitor closely for consumption anomalies",
-          "Check for fuel system issues",
-          "Schedule maintenance inspection",
-        ],
-        standardValues: {
-          expectedDaily: 8.0,
-          standardConsumption: 4.0,
-        },
-      },
-      {
-        machine: "CAT-09",
-        plate: "TN10CD5678",
-        machineType: "L/hr",
-        ownershipType: "Own",
-        totalEntries: 12,
-        avgDailyUsage: 6.8,
-        avgConsumptionRate: 3.2,
-        totalUsage: 81.6,
-        totalDiesel: 261.12,
-        efficiencyTrend: "stable",
-        alertRisk: "medium",
-        recommendations: [
-          "Machine appears under-utilized",
-          "Consider maintenance check",
-        ],
-        standardValues: {
-          expectedDaily: 8.0,
-          standardConsumption: 3.5,
-        },
-      },
-    ];
-  }
-
-  /**
-   * Generate mock performance summary
-   */
-  private getMockPerformanceSummary() {
-    return {
-      totalMachines: 2,
-      highRisk: 1,
-      mediumRisk: 1,
-      lowRisk: 0,
-      improving: 0,
-      declining: 1,
-      stable: 1,
-    };
-  }
-
-  // Enhanced connection checking
+  // Manual connection check (can be called by UI)
   async checkConnection(): Promise<boolean> {
-    console.log("🔍 Checking connection...");
+    console.log("🔍 Manual connection check requested...");
 
     try {
-      // First check internet connectivity using Expo Network
-      const networkState = await Network.getNetworkStateAsync();
+      // Get current network state
+      let netInfoState;
+      try {
+        netInfoState = await NetInfo.fetch();
+      } catch (error) {
+        console.log("⚠️ NetInfo failed, using Expo Network fallback...");
+        const expoState = await Network.getNetworkStateAsync();
+        netInfoState = {
+          type: expoState.type,
+          isConnected: expoState.isConnected,
+          isInternetReachable: expoState.isInternetReachable,
+        };
+      }
 
-      console.log("📶 Network state:", networkState);
+      console.log("📶 Current network state:", netInfoState);
 
-      if (!networkState.isInternetReachable) {
+      if (!netInfoState.isInternetReachable) {
         this.connectionStatus = {
           ...this.connectionStatus,
           isConnected: false,
           isInternetReachable: false,
           lastChecked: new Date().toISOString(),
           error: "No internet connection",
-          networkType: networkState.type,
+          networkType: netInfoState.type,
         };
         await this.cacheData(
           STORAGE_KEYS.CONNECTION_STATUS,
           this.connectionStatus
         );
+        this.notifyConnectionListeners();
         console.log("❌ No internet connection");
         return false;
       }
 
       // Update internet status
       this.connectionStatus.isInternetReachable = true;
-      this.connectionStatus.networkType = networkState.type;
+      this.connectionStatus.networkType = netInfoState.type;
+      this.connectionStatus.error = undefined;
 
-      // Now check backend connection
-      return await this.checkBackendConnection();
+      // Check backend connection
+      const isConnected = await this.checkBackendConnection();
+      this.notifyConnectionListeners();
+      return isConnected;
     } catch (error) {
       console.error("❌ Connection check failed:", error);
       this.connectionStatus = {
@@ -823,6 +615,7 @@ class DieselServiceClass {
         STORAGE_KEYS.CONNECTION_STATUS,
         this.connectionStatus
       );
+      this.notifyConnectionListeners();
       return false;
     }
   }
@@ -831,16 +624,9 @@ class DieselServiceClass {
     const startTime = Date.now();
 
     try {
-      console.log("🔗 Checking backend connection...");
-
-      // Use a simple GET request first to test connectivity
       const testUrl = `${
         CONFIG.APPS_SCRIPT_URL
       }?action=testBackend&timestamp=${Date.now()}`;
-
-      if (DEBUG_MODE) {
-        console.log(`🔍 Testing connection with URL: ${testUrl}`);
-      }
 
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), CONFIG.TIMEOUT);
@@ -857,17 +643,7 @@ class DieselServiceClass {
       clearTimeout(timeoutId);
       const latency = Date.now() - startTime;
 
-      if (DEBUG_MODE) {
-        console.log(`📊 Response details:`, {
-          status: response.status,
-          statusText: response.statusText,
-          contentType: response.headers.get("content-type"),
-          latency: `${latency}ms`,
-        });
-      }
-
       if (response.ok) {
-        // Check if we got JSON response
         const contentType = response.headers.get("content-type");
         if (contentType && contentType.includes("application/json")) {
           console.log(`✅ Backend connected (${latency}ms)`);
@@ -896,7 +672,7 @@ class DieselServiceClass {
           return true;
         } else {
           throw new Error(
-            `Backend returned HTML instead of JSON. Content-Type: ${contentType}. This means the script URL is incorrect or not deployed properly.`
+            `Backend returned HTML instead of JSON. Content-Type: ${contentType}`
           );
         }
       }
@@ -905,7 +681,6 @@ class DieselServiceClass {
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : "Unknown error";
-
       console.log(`❌ Backend connection failed: ${errorMessage}`);
 
       this.connectionStatus = {
@@ -923,73 +698,340 @@ class DieselServiceClass {
     }
   }
 
-  async validateScriptDeployment(): Promise<{
-    isValid: boolean;
-    issues: string[];
-    suggestions: string[];
-  }> {
-    const issues: string[] = [];
-    const suggestions: string[] = [];
-
-    // Check URL format
-    if (!CONFIG.APPS_SCRIPT_URL.includes("/macros/s/")) {
-      issues.push("URL doesn't appear to be a deployed Google Apps Script URL");
-      suggestions.push(
-        "Make sure you're using the deployed web app URL, not the editor URL"
-      );
-    }
-
-    if (!CONFIG.APPS_SCRIPT_URL.endsWith("/exec")) {
-      issues.push("URL doesn't end with '/exec'");
-      suggestions.push("The deployed web app URL should end with '/exec'");
-    }
-
-    if (CONFIG.APPS_SCRIPT_URL.includes("YOUR_ACTUAL_SCRIPT_ID")) {
-      issues.push("Script ID placeholder hasn't been replaced");
-      suggestions.push(
-        "Replace 'YOUR_ACTUAL_SCRIPT_ID' with your actual script ID from deployment"
-      );
-    }
-
-    // Try to access the URL
-    try {
-      const response = await fetch(CONFIG.APPS_SCRIPT_URL, {
-        method: "GET",
-        headers: { Accept: "application/json" },
-      });
-
-      const contentType = response.headers.get("content-type");
-
-      if (!contentType || !contentType.includes("application/json")) {
-        issues.push(`Script returns ${contentType} instead of JSON`);
-        suggestions.push(
-          "Check if the script is deployed properly as a web app"
-        );
-        suggestions.push(
-          "Verify 'Execute as: Me' and 'Who has access: Anyone' settings"
-        );
-      }
-
-      if (response.status === 403) {
-        issues.push("Access forbidden");
-        suggestions.push(
-          "Check script permissions - set 'Who has access' to 'Anyone'"
-        );
-      }
-    } catch (error) {
-      issues.push(`Network error: ${error}`);
-      suggestions.push("Check your internet connection and script URL");
-    }
-
-    return {
-      isValid: issues.length === 0,
-      issues,
-      suggestions,
-    };
+  getConnectionStatus(): ConnectionStatus {
+    return { ...this.connectionStatus };
   }
 
-  getConnectionStatus(): ConnectionStatus {
-    return this.connectionStatus;
+  // Enhanced data retrieval with real-time status
+  async getMachines(): Promise<Machine[]> {
+    try {
+      console.log(
+        `📋 Getting machines... (Connected: ${this.connectionStatus.isConnected}, Internet: ${this.connectionStatus.isInternetReachable})`
+      );
+
+      if (
+        !this.connectionStatus.isConnected ||
+        !this.connectionStatus.isInternetReachable
+      ) {
+        console.log("📱 Using cached/offline data for machines");
+        const cached = await this.getCachedData<Machine[]>(
+          STORAGE_KEYS.MACHINES
+        );
+
+        if (cached && cached.length > 0) {
+          console.log(`✅ Returning ${cached.length} cached machines`);
+          return cached;
+        } else if (this.connectionStatus.hasRealData) {
+          console.log("⚠️ No cached machines but should have real data");
+          return [];
+        } else {
+          console.log("🎭 No cached data, returning demo machines");
+          return this.getMockMachines();
+        }
+      }
+
+      // Try to fetch from backend
+      console.log("📡 Fetching machines from backend...");
+      const response = await this.makeRequest<{ machines: Machine[] }>(
+        `${CONFIG.APPS_SCRIPT_URL}?action=getMachines&timestamp=${Date.now()}`
+      );
+
+      if (response.success && response.machines) {
+        console.log(
+          `✅ Fetched ${response.machines.length} machines from backend`
+        );
+
+        // Cache the data
+        await this.cacheData(STORAGE_KEYS.MACHINES, response.machines);
+
+        // Mark that we have real data
+        this.connectionStatus.hasRealData = true;
+        await this.cacheData(STORAGE_KEYS.HAS_REAL_DATA, true);
+        await this.cacheData(
+          STORAGE_KEYS.CONNECTION_STATUS,
+          this.connectionStatus
+        );
+
+        return response.machines;
+      } else {
+        throw new Error(response.message || "Failed to fetch machines");
+      }
+    } catch (error) {
+      console.error("❌ Error fetching machines:", error);
+
+      // Try to return cached data
+      const cached = await this.getCachedData<Machine[]>(STORAGE_KEYS.MACHINES);
+      if (cached && cached.length > 0) {
+        console.log(`📱 Fallback to ${cached.length} cached machines`);
+        return cached;
+      }
+
+      // Only return mock data if we've never had real data
+      if (!this.connectionStatus.hasRealData) {
+        console.log("🎭 Fallback to demo machines (no real data ever fetched)");
+        return this.getMockMachines();
+      }
+
+      console.log("📭 No machines available");
+      return [];
+    }
+  }
+
+  async getInventory(): Promise<{
+    currentStock: number;
+    transactions: InventoryEntry[];
+  }> {
+    try {
+      console.log(
+        `📦 Getting inventory... (Connected: ${this.connectionStatus.isConnected}, Internet: ${this.connectionStatus.isInternetReachable})`
+      );
+
+      if (
+        !this.connectionStatus.isConnected ||
+        !this.connectionStatus.isInternetReachable
+      ) {
+        console.log("📱 Using cached/offline inventory data");
+        const cached = await this.getCachedData<{
+          currentStock: number;
+          transactions: InventoryEntry[];
+        }>(STORAGE_KEYS.INVENTORY);
+
+        if (cached) {
+          console.log(
+            `✅ Returning cached inventory: ${cached.currentStock}L, ${cached.transactions.length} transactions`
+          );
+          return cached;
+        } else if (this.connectionStatus.hasRealData) {
+          console.log("⚠️ No cached inventory but should have real data");
+          return { currentStock: 0, transactions: [] };
+        } else {
+          console.log("🎭 No cached data, returning demo inventory");
+          return { currentStock: 475, transactions: [] };
+        }
+      }
+
+      console.log("📡 Fetching inventory from backend...");
+      const response = await this.makeRequest<{
+        currentStock: number;
+        transactions: InventoryEntry[];
+      }>(
+        `${CONFIG.APPS_SCRIPT_URL}?action=getInventory&timestamp=${Date.now()}`
+      );
+
+      if (response.success) {
+        const inventoryData = {
+          currentStock: response.currentStock || 0,
+          transactions: response.transactions || [],
+        };
+
+        console.log(
+          `✅ Fetched inventory: ${inventoryData.currentStock}L, ${inventoryData.transactions.length} transactions`
+        );
+
+        // Cache the data
+        await this.cacheData(STORAGE_KEYS.INVENTORY, inventoryData);
+
+        // Mark that we have real data
+        this.connectionStatus.hasRealData = true;
+        await this.cacheData(STORAGE_KEYS.HAS_REAL_DATA, true);
+        await this.cacheData(
+          STORAGE_KEYS.CONNECTION_STATUS,
+          this.connectionStatus
+        );
+
+        return inventoryData;
+      } else {
+        throw new Error(response.message || "Failed to fetch inventory");
+      }
+    } catch (error) {
+      console.error("❌ Error fetching inventory:", error);
+
+      // Return cached data
+      const cached = await this.getCachedData<{
+        currentStock: number;
+        transactions: InventoryEntry[];
+      }>(STORAGE_KEYS.INVENTORY);
+
+      if (cached) {
+        console.log(`📱 Fallback to cached inventory: ${cached.currentStock}L`);
+        return cached;
+      }
+
+      // Only return mock data if we've never had real data
+      if (!this.connectionStatus.hasRealData) {
+        console.log(
+          "🎭 Fallback to demo inventory (no real data ever fetched)"
+        );
+        return { currentStock: 475, transactions: [] };
+      }
+
+      console.log("📭 No inventory data available");
+      return { currentStock: 0, transactions: [] };
+    }
+  }
+
+  async getLogs(filters?: {
+    dateFrom?: string;
+    dateTo?: string;
+    machineName?: string;
+    ownership?: string;
+  }): Promise<{ logs: DieselEntry[]; success: boolean }> {
+    try {
+      console.log(
+        `📊 Getting logs... (Connected: ${this.connectionStatus.isConnected}, Internet: ${this.connectionStatus.isInternetReachable})`
+      );
+
+      if (
+        !this.connectionStatus.isConnected ||
+        !this.connectionStatus.isInternetReachable
+      ) {
+        console.log("📱 Using cached/offline logs data");
+        const cached = await this.getCachedData<DieselEntry[]>(
+          STORAGE_KEYS.LOGS
+        );
+
+        if (cached && cached.length > 0) {
+          console.log(`✅ Returning ${cached.length} cached logs`);
+          return { logs: cached, success: true };
+        } else if (this.connectionStatus.hasRealData) {
+          console.log("⚠️ No cached logs but should have real data");
+          return { logs: [], success: true };
+        } else {
+          console.log("🎭 No cached data, returning demo logs");
+          return { logs: this.getMockLogs(), success: true };
+        }
+      }
+
+      console.log("📡 Fetching logs from backend...");
+      let url = `${
+        CONFIG.APPS_SCRIPT_URL
+      }?action=getLogsEnhanced&timestamp=${Date.now()}`;
+
+      if (filters) {
+        if (filters.dateFrom) url += `&dateFrom=${filters.dateFrom}`;
+        if (filters.dateTo) url += `&dateTo=${filters.dateTo}`;
+        if (filters.machineName)
+          url += `&machineName=${encodeURIComponent(filters.machineName)}`;
+        if (filters.ownership)
+          url += `&ownership=${encodeURIComponent(filters.ownership)}`;
+      }
+
+      const response = await this.makeRequest<{ logs: DieselEntry[] }>(url);
+
+      if (response.success && response.logs) {
+        console.log(`✅ Fetched ${response.logs.length} logs from backend`);
+
+        // Cache the data
+        await this.cacheData(STORAGE_KEYS.LOGS, response.logs);
+
+        // Mark that we have real data
+        this.connectionStatus.hasRealData = true;
+        await this.cacheData(STORAGE_KEYS.HAS_REAL_DATA, true);
+        await this.cacheData(
+          STORAGE_KEYS.CONNECTION_STATUS,
+          this.connectionStatus
+        );
+
+        return { logs: response.logs, success: true };
+      } else {
+        throw new Error(response.message || "Failed to fetch logs");
+      }
+    } catch (error) {
+      console.error("❌ Error fetching logs:", error);
+
+      // Return cached data
+      const cached = await this.getCachedData<DieselEntry[]>(STORAGE_KEYS.LOGS);
+      if (cached && cached.length > 0) {
+        console.log(`📱 Fallback to ${cached.length} cached logs`);
+        return { logs: cached, success: false };
+      }
+
+      // Only return mock data if we've never had real data
+      if (!this.connectionStatus.hasRealData) {
+        console.log("🎭 Fallback to demo logs (no real data ever fetched)");
+        return { logs: this.getMockLogs(), success: false };
+      }
+
+      console.log("📭 No logs available");
+      return { logs: [], success: false };
+    }
+  }
+
+  async getAlertsData(): Promise<{ alerts: AlertData; success: boolean }> {
+    try {
+      console.log(
+        `🚨 Getting alerts... (Connected: ${this.connectionStatus.isConnected}, Internet: ${this.connectionStatus.isInternetReachable})`
+      );
+
+      if (
+        !this.connectionStatus.isConnected ||
+        !this.connectionStatus.isInternetReachable
+      ) {
+        console.log("📱 Using cached/offline alerts data");
+        const cached = await this.getCachedData<AlertData>(
+          "@diesel_tracker:alerts"
+        );
+
+        if (cached) {
+          console.log(`✅ Returning cached alerts`);
+          return { alerts: cached, success: true };
+        } else if (this.connectionStatus.hasRealData) {
+          console.log("⚠️ No cached alerts but should have real data");
+          return {
+            alerts: { overConsumption: [], idleMachines: [] },
+            success: true,
+          };
+        } else {
+          console.log("🎭 No cached data, returning demo alerts");
+          return {
+            alerts: { overConsumption: [], idleMachines: [] },
+            success: true,
+          };
+        }
+      }
+
+      console.log("📡 Fetching alerts from backend...");
+      const response = await this.makeRequest<{ alerts: AlertData }>(
+        `${CONFIG.APPS_SCRIPT_URL}?action=getAlertsData&timestamp=${Date.now()}`
+      );
+
+      if (response.success) {
+        const alertsData = response.alerts || {
+          overConsumption: [],
+          idleMachines: [],
+        };
+
+        // Cache the data
+        await this.cacheData("@diesel_tracker:alerts", alertsData);
+
+        // Mark that we have real data
+        this.connectionStatus.hasRealData = true;
+        await this.cacheData(STORAGE_KEYS.HAS_REAL_DATA, true);
+        await this.cacheData(
+          STORAGE_KEYS.CONNECTION_STATUS,
+          this.connectionStatus
+        );
+
+        return { alerts: alertsData, success: true };
+      } else {
+        throw new Error(response.message || "Failed to fetch alerts data");
+      }
+    } catch (error) {
+      console.error("❌ Error fetching alerts:", error);
+
+      // Return cached data
+      const cached = await this.getCachedData<AlertData>(
+        "@diesel_tracker:alerts"
+      );
+      if (cached) {
+        return { alerts: cached, success: false };
+      }
+
+      return {
+        alerts: { overConsumption: [], idleMachines: [] },
+        success: false,
+      };
+    }
   }
 
   // Enhanced offline queue management
@@ -1037,312 +1079,32 @@ class DieselServiceClass {
     return queueItem.id;
   }
 
-  getQueueStatistics(): {
-    totalItems: number;
-    itemsByType: Record<string, number>;
-    itemsByPriority: Record<number, number>;
-    retryStatistics: {
-      fresh: number;
-      retried: number;
-      nearMaxRetries: number;
+  getOfflineQueueStatus(): { count: number; items: QueuedItem[] } {
+    return {
+      count: this.offlineQueue.length,
+      items: this.offlineQueue,
     };
-  } {
-    const stats = {
-      totalItems: this.offlineQueue.length,
-      itemsByType: {} as Record<string, number>,
-      itemsByPriority: {} as Record<number, number>,
-      retryStatistics: {
-        fresh: 0,
-        retried: 0,
-        nearMaxRetries: 0,
-      },
-    };
-
-    this.offlineQueue.forEach((item) => {
-      // Count by type
-      stats.itemsByType[item.type] = (stats.itemsByType[item.type] || 0) + 1;
-
-      // Count by priority
-      stats.itemsByPriority[item.priority] =
-        (stats.itemsByPriority[item.priority] || 0) + 1;
-
-      // Count retry statistics
-      if (item.retryCount === 0) {
-        stats.retryStatistics.fresh++;
-      } else if (item.retryCount >= item.maxRetries - 1) {
-        stats.retryStatistics.nearMaxRetries++;
-      } else {
-        stats.retryStatistics.retried++;
-      }
-    });
-
-    return stats;
   }
 
-  private async processQueuedEntry(entryData: DieselEntry): Promise<boolean> {
-    try {
-      const response = await this.makeRequest(CONFIG.APPS_SCRIPT_URL, {
-        method: "POST",
-        body: JSON.stringify({
-          action: "submitEntryEnhanced",
-          ...entryData,
-          timestamp: Date.now(),
-        }),
-      });
+  async clearOfflineQueue(): Promise<void> {
+    console.log("🗑️ Clearing offline queue...");
+    this.offlineQueue = [];
+    await this.cacheData(STORAGE_KEYS.OFFLINE_QUEUE, this.offlineQueue);
+  }
 
-      if (response.success) {
-        // Update machine's last reading
-        const machines = await this.getMachines();
-        const machine = machines.find((m) => m.name === entryData.machineName);
-        if (machine) {
-          machine.lastReading = entryData.endReading;
-          machine.updatedAt = new Date().toISOString();
-          await this.cacheData(STORAGE_KEYS.MACHINES, machines);
-        }
-
-        // Update local logs cache
-        const logs =
-          (await this.getCachedData<DieselEntry[]>(STORAGE_KEYS.LOGS)) || [];
-        const existingIndex = logs.findIndex((log) => log.id === entryData.id);
-        if (existingIndex === -1) {
-          logs.unshift(entryData);
-          await this.cacheData(STORAGE_KEYS.LOGS, logs.slice(0, 1000));
-        }
-
-        return true;
-      }
-
-      return false;
-    } catch (error) {
-      console.error("❌ Error processing queued entry:", error);
-      return false;
+  async retryFailedItems(): Promise<void> {
+    console.log("🔄 Manual retry requested...");
+    if (
+      this.connectionStatus.isConnected &&
+      this.connectionStatus.isInternetReachable
+    ) {
+      await this.processOfflineQueue();
+    } else {
+      console.log("⚠️ Cannot retry: no connection");
     }
   }
 
-  private async processQueuedInventory(
-    inventoryData: InventoryEntry
-  ): Promise<boolean> {
-    try {
-      const params = new URLSearchParams({
-        action: "addInventory",
-        litersReceived: inventoryData.litersReceived.toString(),
-        receiptNumber: inventoryData.receiptNumber || "",
-        remarks: inventoryData.remarks || "",
-        receiptImage: inventoryData.receiptImage || "",
-        phoneNumber: inventoryData.phoneNumber,
-        timestamp: Date.now().toString(),
-      });
-
-      const response = await this.makeRequest(
-        `${CONFIG.APPS_SCRIPT_URL}?${params}`
-      );
-
-      if (response.success) {
-        return true;
-      }
-
-      return false;
-    } catch (error) {
-      console.error("❌ Error processing queued inventory:", error);
-      return false;
-    }
-  }
-
-  private async processQueuedMachine(
-    machineData: Omit<Machine, "lastReading" | "id">
-  ): Promise<boolean> {
-    try {
-      console.log(`🏗️ Processing queued machine: ${machineData.name}`);
-
-      const params = new URLSearchParams({
-        action: "addMachineEnhanced",
-        machineName: machineData.name,
-        machinePlate: machineData.plate,
-        machineType: machineData.machineType || "L/hr",
-        ownershipType: machineData.ownershipType || "Own",
-        initialReading: (machineData.initialReading || 0).toString(),
-        standardAvgDiesel: (machineData.standardAvgDiesel || 0).toString(),
-        expectedDailyHours: (machineData.expectedDailyHours || 0).toString(),
-        doorNo: machineData.doorNo || "",
-        remarks: machineData.remarks || "",
-        dateAdded:
-          machineData.dateAdded || new Date().toISOString().split("T")[0],
-        timestamp: Date.now().toString(),
-      });
-
-      const response = await this.makeRequest(
-        `${CONFIG.APPS_SCRIPT_URL}?${params}`
-      );
-
-      if (response.success) {
-        console.log(
-          `✅ Queued machine processed successfully: ${machineData.name}`
-        );
-        return true;
-      } else {
-        console.error(
-          `❌ Failed to process queued machine: ${response.message}`
-        );
-        return false;
-      }
-    } catch (error) {
-      console.error("❌ Error processing queued machine:", error);
-      return false;
-    }
-  }
-
-  private async processQueuedMachineUpdate(updateData: {
-    machineName: string;
-    updates: Partial<Machine>;
-  }): Promise<boolean> {
-    try {
-      console.log(
-        `✏️ Processing queued machine update: ${updateData.machineName}`
-      );
-
-      const params = new URLSearchParams({
-        action: "editMachine",
-        oldName: updateData.machineName,
-        ...Object.entries(updateData.updates).reduce((acc, [key, value]) => {
-          if (value !== undefined && value !== null) {
-            acc[key] = value.toString();
-          }
-          return acc;
-        }, {} as Record<string, string>),
-        updatedAt: new Date().toISOString(),
-        timestamp: Date.now().toString(),
-      });
-
-      const response = await this.makeRequest(
-        `${CONFIG.APPS_SCRIPT_URL}?${params}`
-      );
-
-      if (response.success) {
-        console.log(
-          `✅ Queued machine update processed successfully: ${updateData.machineName}`
-        );
-        return true;
-      } else {
-        console.error(
-          `❌ Failed to process queued machine update: ${response.message}`
-        );
-        return false;
-      }
-    } catch (error) {
-      console.error("❌ Error processing queued machine update:", error);
-      return false;
-    }
-  }
-
-  private async processQueuedMachineDelete(deleteData: {
-    machineName: string;
-    machineData: Machine;
-    options?: {
-      forceDelete?: boolean;
-      deletionReason?: string;
-      deletedBy?: string;
-    };
-  }): Promise<boolean> {
-    try {
-      console.log(
-        `🗑️ Processing queued machine deletion: ${deleteData.machineName}`
-      );
-
-      const params = new URLSearchParams({
-        action: "deleteMachine",
-        machineName: deleteData.machineName,
-        forceDelete: deleteData.options?.forceDelete ? "true" : "false",
-        deletionReason: deleteData.options?.deletionReason || "",
-        deletedBy: deleteData.options?.deletedBy || "System",
-        timestamp: Date.now().toString(),
-      });
-
-      const response = await this.makeRequest(
-        `${CONFIG.APPS_SCRIPT_URL}?${params}`
-      );
-
-      if (response.success) {
-        console.log(
-          `✅ Queued machine deletion processed successfully: ${deleteData.machineName}`
-        );
-        return true;
-      } else {
-        console.error(
-          `❌ Failed to process queued machine deletion: ${response.message}`
-        );
-
-        // If backend says machine has logs and we need confirmation,
-        // we should restore the machine locally and notify user
-        if (response.requiresConfirmation && response.hasLogs) {
-          console.log(
-            `⚠️ Machine ${deleteData.machineName} has logs in backend, restoration may be needed`
-          );
-
-          // Add restoration logic here if needed
-          const machines = await this.getMachines();
-          const existingMachine = machines.find(
-            (m) => m.name === deleteData.machineName
-          );
-
-          if (!existingMachine) {
-            // Restore machine to local cache since backend rejected deletion
-            machines.push(deleteData.machineData);
-            await this.cacheData(STORAGE_KEYS.MACHINES, machines);
-            console.log(
-              `🔄 Restored ${deleteData.machineName} to local cache due to backend logs`
-            );
-          }
-        }
-
-        return false;
-      }
-    } catch (error) {
-      console.error("❌ Error processing queued machine deletion:", error);
-      return false;
-    }
-  }
-
-  private async processQueuedAlertUpdate(alertData: {
-    alertId: string;
-    status: string;
-    resolvedBy?: string;
-    comments?: string;
-  }): Promise<boolean> {
-    try {
-      console.log(`🚨 Processing queued alert update: ${alertData.alertId}`);
-
-      const response = await this.makeRequest(CONFIG.APPS_SCRIPT_URL, {
-        method: "POST",
-        body: JSON.stringify({
-          action: "updateAlertStatus",
-          alertId: alertData.alertId,
-          status: alertData.status,
-          resolvedBy: alertData.resolvedBy,
-          comments: alertData.comments,
-          timestamp: Date.now(),
-        }),
-      });
-
-      if (response.success) {
-        console.log(
-          `✅ Queued alert update processed successfully: ${alertData.alertId}`
-        );
-        return true;
-      } else {
-        console.error(
-          `❌ Failed to process queued alert update: ${response.message}`
-        );
-        return false;
-      }
-    } catch (error) {
-      console.error("❌ Error processing queued alert update:", error);
-      return false;
-    }
-  }
-
-  /**
-   * Enhanced offline queue processing with support for all machine operations
-   */
+  // Enhanced offline queue processing
   private async processOfflineQueue(): Promise<void> {
     if (this.isProcessingQueue || this.offlineQueue.length === 0) {
       return;
@@ -1421,15 +1183,6 @@ class DieselServiceClass {
                 `🚫 Max retries reached for ${item.type} ${item.id}, removing from queue`
               );
               processedItems.push(item.id);
-
-              // Log failed items for debugging
-              console.error(`💀 Failed item details:`, {
-                id: item.id,
-                type: item.type,
-                data: item.data,
-                retryCount: item.retryCount,
-                maxRetries: item.maxRetries,
-              });
             } else {
               failedItems.push(item);
               console.warn(
@@ -1438,7 +1191,7 @@ class DieselServiceClass {
             }
           }
 
-          // Small delay between items to avoid overwhelming the backend
+          // Small delay between items
           await new Promise((resolve) => setTimeout(resolve, 200));
         } catch (error) {
           console.error(`❌ Error processing queue item ${item.id}:`, error);
@@ -1447,7 +1200,6 @@ class DieselServiceClass {
             failedItems.push(item);
           } else {
             processedItems.push(item.id);
-            console.error(`💀 Item ${item.id} failed permanently:`, error);
           }
         }
       }
@@ -1473,7 +1225,7 @@ class DieselServiceClass {
       await this.cacheData(STORAGE_KEYS.OFFLINE_QUEUE, this.offlineQueue);
 
       const failedCount = failedItems.length;
-      const removedCount = processedItems.length - successCount; // Items that failed permanently
+      const removedCount = processedItems.length - successCount;
 
       console.log(
         `✨ Queue processing complete. ` +
@@ -1482,21 +1234,6 @@ class DieselServiceClass {
           `Removed permanently: ${removedCount}, ` +
           `Remaining: ${this.offlineQueue.length}`
       );
-
-      // If we have items that need retry, schedule next processing
-      if (failedItems.length > 0) {
-        console.log(
-          `⏰ Scheduling retry for ${failedItems.length} failed items in 30 seconds`
-        );
-        setTimeout(() => {
-          if (
-            this.connectionStatus.isConnected &&
-            this.connectionStatus.isInternetReachable
-          ) {
-            this.processOfflineQueue();
-          }
-        }, 30000); // Retry in 30 seconds
-      }
     } catch (error) {
       console.error("💥 Error processing offline queue:", error);
     } finally {
@@ -1504,20 +1241,189 @@ class DieselServiceClass {
     }
   }
 
-  // Enhanced API request with better error handling
+  private async processQueuedEntry(entryData: DieselEntry): Promise<boolean> {
+    try {
+      const response = await this.makeRequest(CONFIG.APPS_SCRIPT_URL, {
+        method: "POST",
+        body: JSON.stringify({
+          action: "submitEntryEnhanced",
+          ...entryData,
+          timestamp: Date.now(),
+        }),
+      });
+
+      if (response.success) {
+        // Update machine's last reading
+        const machines = await this.getMachines();
+        const machine = machines.find((m) => m.name === entryData.machineName);
+        if (machine) {
+          machine.lastReading = entryData.endReading;
+          machine.updatedAt = new Date().toISOString();
+          await this.cacheData(STORAGE_KEYS.MACHINES, machines);
+        }
+
+        // Update local logs cache
+        const logs =
+          (await this.getCachedData<DieselEntry[]>(STORAGE_KEYS.LOGS)) || [];
+        const existingIndex = logs.findIndex((log) => log.id === entryData.id);
+        if (existingIndex === -1) {
+          logs.unshift(entryData);
+          await this.cacheData(STORAGE_KEYS.LOGS, logs.slice(0, 1000));
+        }
+
+        return true;
+      }
+
+      return false;
+    } catch (error) {
+      console.error("❌ Error processing queued entry:", error);
+      return false;
+    }
+  }
+
+  private async processQueuedInventory(
+    inventoryData: InventoryEntry
+  ): Promise<boolean> {
+    try {
+      const params = new URLSearchParams({
+        action: "addInventory",
+        litersReceived: inventoryData.litersReceived.toString(),
+        receiptNumber: inventoryData.receiptNumber || "",
+        remarks: inventoryData.remarks || "",
+        receiptImage: inventoryData.receiptImage || "",
+        phoneNumber: inventoryData.phoneNumber,
+        timestamp: Date.now().toString(),
+      });
+
+      const response = await this.makeRequest(
+        `${CONFIG.APPS_SCRIPT_URL}?${params}`
+      );
+
+      return response.success;
+    } catch (error) {
+      console.error("❌ Error processing queued inventory:", error);
+      return false;
+    }
+  }
+
+  private async processQueuedMachine(
+    machineData: Omit<Machine, "lastReading" | "id">
+  ): Promise<boolean> {
+    try {
+      const params = new URLSearchParams({
+        action: "addMachineEnhanced",
+        machineName: machineData.name,
+        machinePlate: machineData.plate,
+        machineType: machineData.machineType || "L/hr",
+        ownershipType: machineData.ownershipType || "Own",
+        initialReading: (machineData.initialReading || 0).toString(),
+        standardAvgDiesel: (machineData.standardAvgDiesel || 0).toString(),
+        expectedDailyHours: (machineData.expectedDailyHours || 0).toString(),
+        doorNo: machineData.doorNo || "",
+        remarks: machineData.remarks || "",
+        dateAdded:
+          machineData.dateAdded || new Date().toISOString().split("T")[0],
+        timestamp: Date.now().toString(),
+      });
+
+      const response = await this.makeRequest(
+        `${CONFIG.APPS_SCRIPT_URL}?${params}`
+      );
+
+      return response.success;
+    } catch (error) {
+      console.error("❌ Error processing queued machine:", error);
+      return false;
+    }
+  }
+
+  private async processQueuedMachineUpdate(updateData: {
+    machineName: string;
+    updates: Partial<Machine>;
+  }): Promise<boolean> {
+    try {
+      const response = await this.makeRequest(CONFIG.APPS_SCRIPT_URL, {
+        method: "POST",
+        body: JSON.stringify({
+          action: "editMachine",
+          oldName: updateData.machineName,
+          ...updateData.updates,
+          updatedAt: new Date().toISOString(),
+          timestamp: Date.now(),
+        }),
+      });
+
+      return response.success;
+    } catch (error) {
+      console.error("❌ Error processing queued machine update:", error);
+      return false;
+    }
+  }
+
+  private async processQueuedMachineDelete(deleteData: {
+    machineName: string;
+    machineData: Machine;
+    options?: {
+      forceDelete?: boolean;
+      deletionReason?: string;
+      deletedBy?: string;
+    };
+  }): Promise<boolean> {
+    try {
+      const params = new URLSearchParams({
+        action: "deleteMachine",
+        machineName: deleteData.machineName,
+        forceDelete: deleteData.options?.forceDelete ? "true" : "false",
+        deletionReason: deleteData.options?.deletionReason || "",
+        deletedBy: deleteData.options?.deletedBy || "System",
+        timestamp: Date.now().toString(),
+      });
+
+      const response = await this.makeRequest(
+        `${CONFIG.APPS_SCRIPT_URL}?${params}`
+      );
+
+      return response.success;
+    } catch (error) {
+      console.error("❌ Error processing queued machine deletion:", error);
+      return false;
+    }
+  }
+
+  private async processQueuedAlertUpdate(alertData: {
+    alertId: string;
+    status: string;
+    resolvedBy?: string;
+    comments?: string;
+  }): Promise<boolean> {
+    try {
+      const response = await this.makeRequest(CONFIG.APPS_SCRIPT_URL, {
+        method: "POST",
+        body: JSON.stringify({
+          action: "updateAlertStatus",
+          alertId: alertData.alertId,
+          status: alertData.status,
+          resolvedBy: alertData.resolvedBy,
+          comments: alertData.comments,
+          timestamp: Date.now(),
+        }),
+      });
+
+      return response.success;
+    } catch (error) {
+      console.error("❌ Error processing queued alert update:", error);
+      return false;
+    }
+  }
+
+  // API request method
   private async makeRequest<T>(
     url: string,
-    options: RequestInit = {},
-    retryCount: number = 0
+    options: RequestInit = {}
   ): Promise<ApiResponse<T>> {
     try {
       if (DEBUG_MODE) {
         console.log(`🔍 Making request to: ${url}`);
-        console.log(`📤 Request options:`, {
-          method: options.method || "GET",
-          headers: options.headers,
-          body: options.body ? "Present" : "None",
-        });
       }
 
       const controller = new AbortController();
@@ -1535,42 +1441,23 @@ class DieselServiceClass {
 
       clearTimeout(timeoutId);
 
-      if (DEBUG_MODE) {
-        console.log(
-          `📥 Response status: ${response.status} ${response.statusText}`
-        );
-        console.log(
-          `📥 Response headers:`,
-          Object.fromEntries(response.headers.entries())
-        );
-      }
-
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       }
 
-      // Check content type
       const contentType = response.headers.get("content-type");
       if (!contentType || !contentType.includes("application/json")) {
-        console.error(`❌ Invalid content type: ${contentType}`);
-
-        // Get the response text for debugging
         const responseText = await response.text();
+        console.error(`❌ Invalid content type: ${contentType}`);
         console.error(
           `📄 Response body (first 500 chars):`,
           responseText.substring(0, 500)
         );
 
-        throw new Error(
-          `Expected JSON response but got: ${contentType}. This usually means the script URL is incorrect or the script is not deployed properly.`
-        );
+        throw new Error(`Expected JSON response but got: ${contentType}`);
       }
 
       const data: ApiResponse<T> = await response.json();
-
-      if (DEBUG_MODE) {
-        console.log(`✅ Parsed JSON response:`, data);
-      }
 
       // Update connection status on successful request
       if (!this.connectionStatus.isConnected) {
@@ -1580,36 +1467,26 @@ class DieselServiceClass {
           STORAGE_KEYS.CONNECTION_STATUS,
           this.connectionStatus
         );
+        this.notifyConnectionListeners();
       }
 
       return data;
     } catch (error) {
-      console.error(`💥 Request failed (attempt ${retryCount + 1}):`, error);
-
-      // Enhanced error logging
-      if (error instanceof TypeError && error.message.includes("JSON")) {
-        console.error(`🚨 JSON Parse Error - This usually means:
-1. Wrong URL (using editor URL instead of deployed web app URL)
-2. Script not deployed as web app
-3. Script permissions not set correctly
-4. CORS issues
-
-Current URL: ${url}
-Make sure you're using the deployed web app URL ending with '/exec'`);
-      }
+      console.error(`💥 Request failed:`, error);
 
       // Update connection status on failed request
+      const wasConnected = this.connectionStatus.isConnected;
       this.connectionStatus.isConnected = false;
       this.connectionStatus.error =
         error instanceof Error ? error.message : "Request failed";
       this.connectionStatus.lastChecked = new Date().toISOString();
 
-      // Retry logic
-      if (retryCount < CONFIG.RETRY_ATTEMPTS - 1) {
-        const delay = Math.pow(2, retryCount) * 1000; // Exponential backoff
-        console.log(`⏳ Retrying in ${delay}ms...`);
-        await new Promise((resolve) => setTimeout(resolve, delay));
-        return this.makeRequest<T>(url, options, retryCount + 1);
+      if (wasConnected) {
+        await this.cacheData(
+          STORAGE_KEYS.CONNECTION_STATUS,
+          this.connectionStatus
+        );
+        this.notifyConnectionListeners();
       }
 
       throw error;
@@ -1921,12 +1798,12 @@ Make sure you're using the deployed web app URL ending with '/exec'`);
             machinePlate: machineWithMeta.plate,
             machineType: machineWithMeta.machineType,
             ownershipType: machineWithMeta.ownershipType,
-            initialReading: machineWithMeta.initialReading.toString(),
-            standardAvgDiesel: machineWithMeta.standardAvgDiesel.toString(),
-            expectedDailyHours: machineWithMeta.expectedDailyHours.toString(),
+            initialReading: machineWithMeta.initialReading!.toString(),
+            standardAvgDiesel: machineWithMeta.standardAvgDiesel!.toString(),
+            expectedDailyHours: machineWithMeta.expectedDailyHours!.toString(),
             doorNo: machineWithMeta.doorNo || "",
             remarks: machineWithMeta.remarks || "",
-            dateAdded: machineWithMeta.dateAdded,
+            dateAdded: machineWithMeta.dateAdded!,
             timestamp: Date.now().toString(),
           });
 
@@ -1979,80 +1856,6 @@ Make sure you're using the deployed web app URL ending with '/exec'`);
     }
   }
 
-  // Cleanup and status methods
-  getOfflineQueueStatus(): { count: number; items: QueuedItem[] } {
-    return {
-      count: this.offlineQueue.length,
-      items: this.offlineQueue,
-    };
-  }
-
-  async clearOfflineQueue(): Promise<void> {
-    console.log("🗑️ Clearing offline queue...");
-    this.offlineQueue = [];
-    await this.cacheData(STORAGE_KEYS.OFFLINE_QUEUE, this.offlineQueue);
-  }
-
-  async retryFailedItems(): Promise<void> {
-    console.log("🔄 Manual retry requested...");
-    if (
-      this.connectionStatus.isConnected &&
-      this.connectionStatus.isInternetReachable
-    ) {
-      await this.processOfflineQueue();
-    } else {
-      console.log("⚠️ Cannot retry: no connection");
-    }
-  }
-
-  // Cleanup on app close
-  destroy(): void {
-    console.log("🧹 Cleaning up DieselService...");
-
-    if (this.syncInterval) {
-      clearInterval(this.syncInterval);
-    }
-    if (this.connectionCheckInterval) {
-      clearInterval(this.connectionCheckInterval);
-    }
-    if (this.quickPingInterval) {
-      clearInterval(this.quickPingInterval);
-    }
-  }
-
-  // Keep existing methods for getting data
-  async getMachines(): Promise<Machine[]> {
-    try {
-      if (!this.connectionStatus.isConnected) {
-        const cached = await this.getCachedData<Machine[]>(
-          STORAGE_KEYS.MACHINES
-        );
-        return cached || this.getMockMachines();
-      }
-
-      const response = await this.makeRequest<{ machines: Machine[] }>(
-        `${CONFIG.APPS_SCRIPT_URL}?action=getMachines&timestamp=${Date.now()}`
-      );
-
-      if (response.success && response.machines) {
-        await this.cacheData(STORAGE_KEYS.MACHINES, response.machines);
-        return response.machines;
-      } else {
-        throw new Error(response.message || "Failed to fetch machines");
-      }
-    } catch (error) {
-      console.error("❌ Error fetching machines:", error);
-
-      // Try to return cached data
-      const cached = await this.getCachedData<Machine[]>(STORAGE_KEYS.MACHINES);
-      if (cached && cached.length > 0) {
-        return cached;
-      }
-
-      return this.getMockMachines();
-    }
-  }
-
   // FIXED: updateMachine method in DieselService
   async updateMachine(
     machineName: string,
@@ -2079,7 +1882,7 @@ Make sure you're using the deployed web app URL ending with '/exec'`);
         const duplicateName = machines.find(
           (m) =>
             m.name !== machineName &&
-            m.name.toLowerCase() === updates.name.trim().toLowerCase()
+            m.name.toLowerCase() === updates.name!.trim().toLowerCase()
         );
         if (duplicateName) {
           return {
@@ -2093,7 +1896,7 @@ Make sure you're using the deployed web app URL ending with '/exec'`);
         const duplicatePlate = machines.find(
           (m) =>
             m.name !== machineName &&
-            m.plate?.toLowerCase() === updates.plate.trim().toLowerCase()
+            m.plate?.toLowerCase() === updates.plate!.trim().toLowerCase()
         );
         if (duplicatePlate) {
           return {
@@ -2538,158 +2341,6 @@ Make sure you're using the deployed web app URL ending with '/exec'`);
     }
   }
 
-  // Cache Management
-  async cacheData(key: string, data: any): Promise<void> {
-    try {
-      const cacheEntry = {
-        data,
-        timestamp: Date.now(),
-        expires: Date.now() + CONFIG.CACHE_DURATION,
-      };
-      await AsyncStorage.setItem(key, JSON.stringify(cacheEntry));
-    } catch (error) {
-      console.error("❌ Error caching data:", error);
-    }
-  }
-
-  async getCachedData<T>(key: string): Promise<T | null> {
-    try {
-      const cached = await AsyncStorage.getItem(key);
-      if (!cached) return null;
-
-      const cacheEntry = JSON.parse(cached);
-
-      // Check if cache is still valid
-      if (cacheEntry.expires && Date.now() > cacheEntry.expires) {
-        await AsyncStorage.removeItem(key);
-        return null;
-      }
-
-      return cacheEntry.data;
-    } catch (error) {
-      console.error("❌ Error getting cached data:", error);
-      return null;
-    }
-  }
-
-  // Keep existing methods for inventory, logs, alerts, etc.
-  async getInventory(): Promise<{
-    currentStock: number;
-    transactions: InventoryEntry[];
-  }> {
-    try {
-      if (!this.connectionStatus.isConnected) {
-        const cached = await this.getCachedData<{
-          currentStock: number;
-          transactions: InventoryEntry[];
-        }>(STORAGE_KEYS.INVENTORY);
-        return cached || { currentStock: 475, transactions: [] };
-      }
-
-      const response = await this.makeRequest<{
-        currentStock: number;
-        transactions: InventoryEntry[];
-      }>(
-        `${CONFIG.APPS_SCRIPT_URL}?action=getInventory&timestamp=${Date.now()}`
-      );
-
-      if (response.success) {
-        const inventoryData = {
-          currentStock: response.currentStock || 0,
-          transactions: response.transactions || [],
-        };
-
-        await this.cacheData(STORAGE_KEYS.INVENTORY, inventoryData);
-        return inventoryData;
-      } else {
-        throw new Error(response.message || "Failed to fetch inventory");
-      }
-    } catch (error) {
-      console.error("❌ Error fetching inventory:", error);
-
-      // Return cached data
-      const cached = await this.getCachedData<{
-        currentStock: number;
-        transactions: InventoryEntry[];
-      }>(STORAGE_KEYS.INVENTORY);
-      return cached || { currentStock: 0, transactions: [] };
-    }
-  }
-
-  async getLogs(filters?: {
-    dateFrom?: string;
-    dateTo?: string;
-    machineName?: string;
-    ownership?: string;
-  }): Promise<{ logs: DieselEntry[]; success: boolean }> {
-    try {
-      if (!this.connectionStatus.isConnected) {
-        const cached = await this.getCachedData<DieselEntry[]>(
-          STORAGE_KEYS.LOGS
-        );
-        return { logs: cached || [], success: true };
-      }
-
-      let url = `${
-        CONFIG.APPS_SCRIPT_URL
-      }?action=getLogsEnhanced&timestamp=${Date.now()}`;
-
-      if (filters) {
-        if (filters.dateFrom) url += `&dateFrom=${filters.dateFrom}`;
-        if (filters.dateTo) url += `&dateTo=${filters.dateTo}`;
-        if (filters.machineName)
-          url += `&machineName=${encodeURIComponent(filters.machineName)}`;
-        if (filters.ownership)
-          url += `&ownership=${encodeURIComponent(filters.ownership)}`;
-      }
-
-      const response = await this.makeRequest<{ logs: DieselEntry[] }>(url);
-
-      if (response.success && response.logs) {
-        await this.cacheData(STORAGE_KEYS.LOGS, response.logs);
-        return { logs: response.logs, success: true };
-      } else {
-        throw new Error(response.message || "Failed to fetch logs");
-      }
-    } catch (error) {
-      console.error("❌ Error fetching logs:", error);
-
-      // Return cached data
-      const cached = await this.getCachedData<DieselEntry[]>(STORAGE_KEYS.LOGS);
-      return { logs: cached || [], success: false };
-    }
-  }
-
-  async getAlertsData(): Promise<{ alerts: AlertData; success: boolean }> {
-    try {
-      if (!this.connectionStatus.isConnected) {
-        return {
-          alerts: { overConsumption: [], idleMachines: [] },
-          success: true,
-        };
-      }
-
-      const response = await this.makeRequest<{ alerts: AlertData }>(
-        `${CONFIG.APPS_SCRIPT_URL}?action=getAlertsData&timestamp=${Date.now()}`
-      );
-
-      if (response.success) {
-        return {
-          alerts: response.alerts || { overConsumption: [], idleMachines: [] },
-          success: true,
-        };
-      } else {
-        throw new Error(response.message || "Failed to fetch alerts data");
-      }
-    } catch (error) {
-      console.error("❌ Error fetching alerts:", error);
-      return {
-        alerts: { overConsumption: [], idleMachines: [] },
-        success: false,
-      };
-    }
-  }
-
   // Image upload
   async uploadImage(imageUri: string, fileName: string): Promise<string> {
     try {
@@ -2737,6 +2388,40 @@ Make sure you're using the deployed web app URL ending with '/exec'`);
     }
   }
 
+  // Cache Management
+  async cacheData(key: string, data: any): Promise<void> {
+    try {
+      const cacheEntry = {
+        data,
+        timestamp: Date.now(),
+        expires: Date.now() + CONFIG.CACHE_DURATION,
+      };
+      await AsyncStorage.setItem(key, JSON.stringify(cacheEntry));
+    } catch (error) {
+      console.error("❌ Error caching data:", error);
+    }
+  }
+
+  async getCachedData<T>(key: string): Promise<T | null> {
+    try {
+      const cached = await AsyncStorage.getItem(key);
+      if (!cached) return null;
+
+      const cacheEntry = JSON.parse(cached);
+
+      // Check if cache is still valid
+      if (cacheEntry.expires && Date.now() > cacheEntry.expires) {
+        await AsyncStorage.removeItem(key);
+        return null;
+      }
+
+      return cacheEntry.data;
+    } catch (error) {
+      console.error("❌ Error getting cached data:", error);
+      return null;
+    }
+  }
+
   // Mock data methods
   private getMockMachines(): Machine[] {
     return [
@@ -2773,6 +2458,59 @@ Make sure you're using the deployed web app URL ending with '/exec'`);
         updatedAt: new Date().toISOString(),
       },
     ];
+  }
+
+  private getMockLogs(): DieselEntry[] {
+    return [
+      {
+        id: "log_1",
+        machineName: "JCB-12",
+        startReading: 1200.0,
+        endReading: 1250.5,
+        dieselFilled: 45.0,
+        remarks: "Full day operation",
+        phoneNumber: "9876543210",
+        timestamp: new Date().toISOString(),
+        usage: 50.5,
+        rate: 0.89,
+        machineType: "L/hr",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      },
+      {
+        id: "log_2",
+        machineName: "CAT-09",
+        startReading: 850.0,
+        endReading: 890.2,
+        dieselFilled: 35.0,
+        remarks: "Half day operation",
+        phoneNumber: "9876543210",
+        timestamp: new Date().toISOString(),
+        usage: 40.2,
+        rate: 0.87,
+        machineType: "L/hr",
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      },
+    ];
+  }
+
+  // Cleanup on app close
+  destroy(): void {
+    console.log("🧹 Cleaning up DieselService...");
+
+    if (this.syncInterval) {
+      clearInterval(this.syncInterval);
+    }
+    if (this.connectionCheckInterval) {
+      clearInterval(this.connectionCheckInterval);
+    }
+    if (this.realTimeCheckInterval) {
+      clearInterval(this.realTimeCheckInterval);
+    }
+    if (this.netInfoUnsubscribe) {
+      this.netInfoUnsubscribe();
+    }
   }
 }
 

@@ -1,70 +1,76 @@
 // hooks/useConnectionStatus.ts
-import { useState, useEffect, useCallback } from "react";
-import {
-  DieselService,
-  ConnectionStatus,
-  QueuedItem,
-} from "@/services/DieselService";
+import { useState, useEffect } from "react";
+import { DieselService, ConnectionStatus } from "@/services/DieselService";
 
-interface UseConnectionStatusReturn {
-  connectionStatus: ConnectionStatus;
-  queueStatus: {
-    count: number;
-    items: QueuedItem[];
-  };
-  isOnline: boolean;
-  isConnectedToBackend: boolean;
-  refreshConnection: () => Promise<void>;
-  retryQueue: () => Promise<void>;
-  clearQueue: () => Promise<void>;
-}
-
-export function useConnectionStatus(): UseConnectionStatusReturn {
-  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>(
-    DieselService.getConnectionStatus()
-  );
-  const [queueStatus, setQueueStatus] = useState({
-    count: 0,
-    items: [] as QueuedItem[],
+export function useConnectionStatus() {
+  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>({
+    isConnected: false,
+    isInternetReachable: false,
+    lastChecked: new Date().toISOString(),
+    hasRealData: false,
   });
 
-  const updateStatus = useCallback(() => {
-    setConnectionStatus(DieselService.getConnectionStatus());
-    setQueueStatus(DieselService.getOfflineQueueStatus());
+  useEffect(() => {
+    // Get initial status
+    const initialStatus = DieselService.getConnectionStatus();
+    setConnectionStatus(initialStatus);
+
+    // Subscribe to real-time updates
+    const unsubscribe = DieselService.addConnectionListener((status) => {
+      console.log("🔄 Connection status updated:", status);
+      setConnectionStatus(status);
+    });
+
+    // Cleanup subscription
+    return unsubscribe;
   }, []);
 
-  const refreshConnection = useCallback(async () => {
+  const refreshConnection = async () => {
     await DieselService.checkConnection();
-    updateStatus();
-  }, [updateStatus]);
+  };
 
-  const retryQueue = useCallback(async () => {
-    await DieselService.retryFailedItems();
-    updateStatus();
-  }, [updateStatus]);
+  const getStatusColor = () => {
+    if (connectionStatus.isConnected && connectionStatus.isInternetReachable) {
+      return "#28a745"; // Green - fully connected
+    } else if (connectionStatus.isInternetReachable) {
+      return "#ffc107"; // Yellow - internet but no backend
+    } else {
+      return "#dc3545"; // Red - no internet
+    }
+  };
 
-  const clearQueue = useCallback(async () => {
-    await DieselService.clearOfflineQueue();
-    updateStatus();
-  }, [updateStatus]);
+  const getStatusText = () => {
+    if (connectionStatus.isConnected && connectionStatus.isInternetReachable) {
+      return "✅ Connected";
+    } else if (connectionStatus.isInternetReachable) {
+      return "⚠️ Backend Offline";
+    } else {
+      return "❌ No Internet";
+    }
+  };
 
-  useEffect(() => {
-    // Update status immediately
-    updateStatus();
+  const getDataSourceText = () => {
+    if (connectionStatus.isConnected) {
+      return "🌐 Live Data";
+    } else if (connectionStatus.hasRealData) {
+      return "📱 Cached Data";
+    } else {
+      return "🎭 Demo Mode";
+    }
+  };
 
-    // Set up periodic updates
-    const interval = setInterval(updateStatus, 5000); // Update every 5 seconds
-
-    return () => clearInterval(interval);
-  }, [updateStatus]);
+  const isOnline = connectionStatus.isInternetReachable;
+  const isConnectedToBackend = connectionStatus.isConnected;
+  const hasRealData = connectionStatus.hasRealData;
 
   return {
     connectionStatus,
-    queueStatus,
-    isOnline: connectionStatus.isInternetReachable,
-    isConnectedToBackend: connectionStatus.isConnected,
+    isOnline,
+    isConnectedToBackend,
+    hasRealData,
     refreshConnection,
-    retryQueue,
-    clearQueue,
+    getStatusColor,
+    getStatusText,
+    getDataSourceText,
   };
 }

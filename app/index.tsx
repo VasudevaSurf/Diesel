@@ -15,7 +15,7 @@ import { ThemedView } from "@/components/ThemedView";
 import { IconSymbol } from "@/components/ui/IconSymbol";
 import { Colors } from "@/constants/Colors";
 import { useColorScheme } from "@/hooks/useColorScheme";
-import { DieselService } from "@/services/DieselService";
+import { DieselService, ConnectionStatus } from "@/services/DieselService";
 
 const { width } = Dimensions.get("window");
 
@@ -26,73 +26,131 @@ interface AlertData {
 
 export default function HomeScreen() {
   const colorScheme = useColorScheme();
-  const [connectionStatus, setConnectionStatus] = useState<
-    "checking" | "connected" | "offline"
-  >("checking");
+
+  // Real-time connection status
+  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>({
+    isConnected: false,
+    isInternetReachable: false,
+    lastChecked: new Date().toISOString(),
+    hasRealData: false,
+  });
+
   const [currentBalance, setCurrentBalance] = useState<number>(0);
   const [totalMachines, setTotalMachines] = useState<number>(0);
   const [alerts, setAlerts] = useState<AlertData>({
     overConsumption: [],
     idleMachines: [],
   });
+  const [loading, setLoading] = useState(true);
+  const [lastRefresh, setLastRefresh] = useState<string>("");
 
   useEffect(() => {
+    // Subscribe to real-time connection status updates
+    const unsubscribe = DieselService.addConnectionListener((status) => {
+      console.log("🏠 Home screen received connection update:", status);
+      setConnectionStatus(status);
+
+      // If connection is restored, refresh data
+      if (status.isConnected && status.isInternetReachable) {
+        console.log("🔄 Connection restored, refreshing data...");
+        loadDashboardData();
+      }
+    });
+
+    // Initial data load
     initializeApp();
+
+    // Cleanup subscription on unmount
+    return () => {
+      unsubscribe();
+    };
   }, []);
 
   const initializeApp = async () => {
     try {
-      // Check backend connection
-      const isConnected = await DieselService.checkConnection();
-      setConnectionStatus(isConnected ? "connected" : "offline");
+      setLoading(true);
 
-      if (isConnected) {
-        // Load dashboard data
-        const [machines, inventory, alertsData] = await Promise.all([
-          DieselService.getMachines(),
-          DieselService.getInventory(),
-          DieselService.getAlertsData(),
-        ]);
+      // Get initial connection status
+      const initialStatus = DieselService.getConnectionStatus();
+      setConnectionStatus(initialStatus);
 
-        setTotalMachines(machines.length);
-        setCurrentBalance(inventory.currentStock || 0);
-        setAlerts(
-          alertsData.alerts || { overConsumption: [], idleMachines: [] }
-        );
-      } else {
-        // Demo mode data
-        setTotalMachines(3);
-        setCurrentBalance(475);
-        setAlerts({
-          overConsumption: [{ machine: "JCB-12", mismatch: 1.2 }],
-          idleMachines: [{ machine: "CAT-09", mismatch: -3 }],
-        });
-      }
+      // Load dashboard data
+      await loadDashboardData();
     } catch (error) {
       console.error("Error initializing app:", error);
-      setConnectionStatus("offline");
+    } finally {
+      setLoading(false);
     }
   };
 
+  const loadDashboardData = async () => {
+    try {
+      console.log("📊 Loading dashboard data...");
+
+      const [machines, inventory, alertsData] = await Promise.all([
+        DieselService.getMachines(),
+        DieselService.getInventory(),
+        DieselService.getAlertsData(),
+      ]);
+
+      setTotalMachines(machines.length);
+      setCurrentBalance(inventory.currentStock || 0);
+      setAlerts(alertsData.alerts || { overConsumption: [], idleMachines: [] });
+      setLastRefresh(new Date().toLocaleTimeString());
+
+      console.log(
+        `✅ Dashboard loaded: ${machines.length} machines, ${inventory.currentStock}L fuel`
+      );
+    } catch (error) {
+      console.error("Error loading dashboard data:", error);
+
+      // Fallback to cached/demo data
+      setTotalMachines(3);
+      setCurrentBalance(475);
+      setAlerts({
+        overConsumption: [{ machine: "JCB-12", mismatch: 1.2 }],
+        idleMachines: [{ machine: "CAT-09", mismatch: -3 }],
+      });
+    }
+  };
+
+  const handleRefresh = async () => {
+    console.log("🔄 Manual refresh requested");
+
+    // Force connection check
+    await DieselService.checkConnection();
+
+    // Reload data
+    await loadDashboardData();
+  };
+
   const getConnectionStatusColor = () => {
-    switch (connectionStatus) {
-      case "connected":
-        return "#28a745";
-      case "offline":
-        return "#dc3545";
-      default:
-        return "#ffc107";
+    if (connectionStatus.isConnected && connectionStatus.isInternetReachable) {
+      return "#28a745"; // Green - fully connected
+    } else if (connectionStatus.isInternetReachable) {
+      return "#ffc107"; // Yellow - internet but no backend
+    } else {
+      return "#dc3545"; // Red - no internet
     }
   };
 
   const getConnectionStatusText = () => {
-    switch (connectionStatus) {
-      case "connected":
-        return "✅ Backend Connected";
-      case "offline":
-        return "❌ Offline Mode";
-      default:
-        return "🔄 Checking Connection...";
+    if (connectionStatus.isConnected && connectionStatus.isInternetReachable) {
+      return "✅ Backend Connected";
+    } else if (connectionStatus.isInternetReachable) {
+      return "⚠️ Backend Offline";
+    } else {
+      return "❌ No Internet";
+    }
+  };
+
+  const getDataSourceIndicator = () => {
+    if (connectionStatus.isConnected) {
+      return "🌐 Live Data";
+    } else if (connectionStatus.hasRealData) {
+      return "📱 Cached Data";
+    } else {
+      return "🎭 Demo Mode";
     }
   };
 
@@ -126,6 +184,14 @@ export default function HomeScreen() {
       disabled: false,
     },
     {
+      title: "Alerts",
+      subtitle: `${getTotalAlerts()} active alerts`,
+      icon: "warning",
+      color: "#FF9800",
+      route: "/alerts",
+      disabled: false,
+    },
+    {
       title: "Admin Panel",
       subtitle: "Manage machines & settings",
       icon: "gear.circle.fill",
@@ -136,60 +202,21 @@ export default function HomeScreen() {
   ];
 
   const handleNavigation = (route: string) => {
-    if (route === "/admin") {
-      Alert.prompt(
-        "Admin Access",
-        "Enter admin password:",
-        [
-          { text: "Cancel", style: "cancel" },
-          {
-            text: "OK",
-            onPress: (password) => {
-              if (password === "admin123") {
-                router.push(route as any);
-              } else {
-                Alert.alert("Error", "Incorrect password!");
-              }
-            },
-          },
-        ],
-        "secure-text"
-      );
-    } else if (route === "/inventory") {
-      Alert.prompt(
-        "Inventory Access",
-        "Enter inventory password:",
-        [
-          { text: "Cancel", style: "cancel" },
-          {
-            text: "OK",
-            onPress: (password) => {
-              if (password === "inventory456") {
-                router.push(route as any);
-              } else {
-                Alert.alert("Error", "Incorrect inventory password!");
-              }
-            },
-          },
-        ],
-        "secure-text"
-      );
-    } else {
-      router.push(route as any);
-    }
+    router.push(route as any);
   };
 
   return (
     <ThemedView style={styles.container}>
       <StatusBar style={colorScheme === "dark" ? "light" : "dark"} />
 
-      {/* Header */}
+      {/* Header with Real-time Connection Status */}
       <View
         style={[
           styles.header,
           { backgroundColor: Colors[colorScheme ?? "light"].tint },
         ]}
       >
+        {/* Alert Badge */}
         {getTotalAlerts() > 0 && (
           <View style={styles.alertBadge}>
             <Text style={styles.alertBadgeText}>
@@ -205,17 +232,94 @@ export default function HomeScreen() {
           ✨ Enhanced Machine Management | 📊 Smart Reports
         </ThemedText>
 
-        <View
+        {/* Real-time Connection Status */}
+        <TouchableOpacity
           style={[
             styles.statusIndicator,
             { backgroundColor: getConnectionStatusColor() },
           ]}
+          onPress={handleRefresh}
+          activeOpacity={0.8}
         >
           <Text style={styles.statusText}>{getConnectionStatusText()}</Text>
+          {connectionStatus.latency && (
+            <Text style={styles.latencyText}>{connectionStatus.latency}ms</Text>
+          )}
+        </TouchableOpacity>
+
+        {/* Data Source Indicator */}
+        <View style={styles.dataSourceIndicator}>
+          <Text style={styles.dataSourceText}>{getDataSourceIndicator()}</Text>
+          {lastRefresh && (
+            <Text style={styles.lastRefreshText}>Updated: {lastRefresh}</Text>
+          )}
         </View>
       </View>
 
       <ScrollView style={styles.content} showsVerticalScrollIndicator={false}>
+        {/* Connection Details Card */}
+        <View style={styles.connectionCard}>
+          <View style={styles.connectionHeader}>
+            <Text style={styles.connectionTitle}>Connection Status</Text>
+            <TouchableOpacity
+              onPress={handleRefresh}
+              style={styles.refreshButton}
+            >
+              <IconSymbol name="refresh" size={16} color="#666" />
+            </TouchableOpacity>
+          </View>
+
+          <View style={styles.connectionDetails}>
+            <View style={styles.connectionRow}>
+              <Text style={styles.connectionLabel}>Internet:</Text>
+              <Text
+                style={[
+                  styles.connectionValue,
+                  {
+                    color: connectionStatus.isInternetReachable
+                      ? "#28a745"
+                      : "#dc3545",
+                  },
+                ]}
+              >
+                {connectionStatus.isInternetReachable
+                  ? "Connected"
+                  : "Disconnected"}
+              </Text>
+            </View>
+
+            <View style={styles.connectionRow}>
+              <Text style={styles.connectionLabel}>Backend:</Text>
+              <Text
+                style={[
+                  styles.connectionValue,
+                  {
+                    color: connectionStatus.isConnected ? "#28a745" : "#dc3545",
+                  },
+                ]}
+              >
+                {connectionStatus.isConnected ? "Connected" : "Disconnected"}
+              </Text>
+            </View>
+
+            <View style={styles.connectionRow}>
+              <Text style={styles.connectionLabel}>Network:</Text>
+              <Text style={styles.connectionValue}>
+                {connectionStatus.networkType || "Unknown"}
+              </Text>
+            </View>
+
+            {connectionStatus.error && (
+              <View style={styles.connectionRow}>
+                <Text style={styles.connectionLabel}>Error:</Text>
+                <Text style={[styles.connectionValue, { color: "#dc3545" }]}>
+                  {connectionStatus.error}
+                </Text>
+              </View>
+            )}
+          </View>
+        </View>
+
         {/* Quick Stats */}
         <View style={styles.statsContainer}>
           <View style={[styles.statCard, { backgroundColor: "#4CAF50" }]}>
@@ -304,12 +408,14 @@ export default function HomeScreen() {
         {/* Footer Info */}
         <View style={styles.footer}>
           <ThemedText style={styles.footerText}>
-            Version 2.9+ Enhanced Edition
+            Version 3.0+ Real-time Edition
           </ThemedText>
           <ThemedText style={styles.footerText}>
-            {connectionStatus === "offline"
-              ? "Demo Mode Active"
-              : "Production Ready"}
+            {connectionStatus.isConnected
+              ? "Production Ready"
+              : connectionStatus.hasRealData
+              ? "Cached Mode"
+              : "Demo Mode Active"}
           </ThemedText>
         </View>
       </ScrollView>
@@ -359,20 +465,88 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
     borderRadius: 8,
     alignSelf: "center",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
   },
   statusText: {
     color: "white",
     fontSize: 14,
     fontWeight: "600",
   },
+  latencyText: {
+    color: "rgba(255, 255, 255, 0.8)",
+    fontSize: 12,
+  },
+  dataSourceIndicator: {
+    marginTop: 8,
+    alignItems: "center",
+  },
+  dataSourceText: {
+    color: "rgba(255, 255, 255, 0.9)",
+    fontSize: 12,
+    fontWeight: "500",
+  },
+  lastRefreshText: {
+    color: "rgba(255, 255, 255, 0.7)",
+    fontSize: 11,
+    marginTop: 2,
+  },
   content: {
     flex: 1,
     paddingHorizontal: 20,
   },
+  connectionCard: {
+    backgroundColor: "white",
+    borderRadius: 12,
+    padding: 15,
+    marginTop: 20,
+    marginBottom: 20,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  connectionHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 15,
+    paddingBottom: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: "#f0f0f0",
+  },
+  connectionTitle: {
+    fontSize: 16,
+    fontWeight: "bold",
+    color: "#333",
+  },
+  refreshButton: {
+    padding: 8,
+    borderRadius: 6,
+    backgroundColor: "#f8f9fa",
+  },
+  connectionDetails: {
+    gap: 8,
+  },
+  connectionRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+  connectionLabel: {
+    fontSize: 14,
+    color: "#666",
+    fontWeight: "500",
+  },
+  connectionValue: {
+    fontSize: 14,
+    fontWeight: "600",
+  },
   statsContainer: {
     flexDirection: "row",
     justifyContent: "space-between",
-    marginTop: 20,
     marginBottom: 30,
   },
   statCard: {
