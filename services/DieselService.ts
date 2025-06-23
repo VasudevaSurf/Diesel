@@ -4,7 +4,7 @@ import * as Network from "expo-network";
 // Configuration
 const CONFIG = {
   APPS_SCRIPT_URL:
-    "https://script.google.com/macros/s/AKfycbyqGusXd-536tQDqPpHNiWcCrrL70Rtg5LncRi0pkTK3oBcDQKGUk6vZnUs_g5Krz9G/exec",
+    "https://script.google.com/macros/s/AKfycbxtBrJY5SPUFtZv5cXu65SUSy7wyAIVHx6zYEtGG7pWu82JwrRegUWvw8LGBeSAo7DY/exec",
   ADMIN_PASSWORD: "admin123",
   INVENTORY_PASSWORD: "inventory456",
   TIMEOUT: 15000, // Reduced to 15 seconds for better UX
@@ -1037,104 +1037,46 @@ class DieselServiceClass {
     return queueItem.id;
   }
 
-  private async processOfflineQueue(): Promise<void> {
-    if (this.isProcessingQueue || this.offlineQueue.length === 0) {
-      return;
-    }
+  getQueueStatistics(): {
+    totalItems: number;
+    itemsByType: Record<string, number>;
+    itemsByPriority: Record<number, number>;
+    retryStatistics: {
+      fresh: number;
+      retried: number;
+      nearMaxRetries: number;
+    };
+  } {
+    const stats = {
+      totalItems: this.offlineQueue.length,
+      itemsByType: {} as Record<string, number>,
+      itemsByPriority: {} as Record<number, number>,
+      retryStatistics: {
+        fresh: 0,
+        retried: 0,
+        nearMaxRetries: 0,
+      },
+    };
 
-    if (
-      !this.connectionStatus.isConnected ||
-      !this.connectionStatus.isInternetReachable
-    ) {
-      console.log("⏸️ Cannot process queue: no connection");
-      return;
-    }
+    this.offlineQueue.forEach((item) => {
+      // Count by type
+      stats.itemsByType[item.type] = (stats.itemsByType[item.type] || 0) + 1;
 
-    this.isProcessingQueue = true;
-    console.log(
-      `🔄 Processing offline queue with ${this.offlineQueue.length} items...`
-    );
+      // Count by priority
+      stats.itemsByPriority[item.priority] =
+        (stats.itemsByPriority[item.priority] || 0) + 1;
 
-    try {
-      const processedItems: string[] = [];
-      const failedItems: QueuedItem[] = [];
-      let successCount = 0;
-
-      for (const item of this.offlineQueue) {
-        try {
-          console.log(
-            `⚙️ Processing queued ${item.type} (attempt ${
-              item.retryCount + 1
-            }/${item.maxRetries})`
-          );
-
-          let success = false;
-
-          switch (item.type) {
-            case "entry":
-              success = await this.processQueuedEntry(item.data);
-              break;
-            case "inventory":
-              success = await this.processQueuedInventory(item.data);
-              break;
-            case "machine":
-              success = await this.processQueuedMachine(item.data);
-              break;
-            case "machineUpdate":
-              success = await this.processQueuedMachineUpdate(item.data);
-              break;
-            default:
-              console.warn(`❓ Unknown queue item type: ${item.type}`);
-              success = true; // Remove unknown types
-          }
-
-          if (success) {
-            processedItems.push(item.id);
-            successCount++;
-            console.log(`✅ Successfully processed ${item.type} ${item.id}`);
-          } else {
-            item.retryCount++;
-            if (item.retryCount >= item.maxRetries) {
-              console.error(
-                `🚫 Max retries reached for ${item.type} ${item.id}, removing from queue`
-              );
-              processedItems.push(item.id);
-            } else {
-              failedItems.push(item);
-              console.warn(
-                `⚠️ Failed to process ${item.type} ${item.id}, will retry later (${item.retryCount}/${item.maxRetries})`
-              );
-            }
-          }
-        } catch (error) {
-          console.error(`❌ Error processing queue item ${item.id}:`, error);
-          item.retryCount++;
-          if (item.retryCount < item.maxRetries) {
-            failedItems.push(item);
-          } else {
-            processedItems.push(item.id);
-          }
-        }
+      // Count retry statistics
+      if (item.retryCount === 0) {
+        stats.retryStatistics.fresh++;
+      } else if (item.retryCount >= item.maxRetries - 1) {
+        stats.retryStatistics.nearMaxRetries++;
+      } else {
+        stats.retryStatistics.retried++;
       }
+    });
 
-      // Remove processed items from queue
-      this.offlineQueue = this.offlineQueue.filter(
-        (item) => !processedItems.includes(item.id)
-      );
-
-      // Add failed items back with updated retry count
-      this.offlineQueue = [...failedItems, ...this.offlineQueue];
-
-      await this.cacheData(STORAGE_KEYS.OFFLINE_QUEUE, this.offlineQueue);
-
-      console.log(
-        `✨ Queue processing complete. Processed: ${successCount}, Failed: ${failedItems.length}, Remaining: ${this.offlineQueue.length}`
-      );
-    } catch (error) {
-      console.error("💥 Error processing offline queue:", error);
-    } finally {
-      this.isProcessingQueue = false;
-    }
+    return stats;
   }
 
   private async processQueuedEntry(entryData: DieselEntry): Promise<boolean> {
@@ -1210,6 +1152,8 @@ class DieselServiceClass {
     machineData: Omit<Machine, "lastReading" | "id">
   ): Promise<boolean> {
     try {
+      console.log(`🏗️ Processing queued machine: ${machineData.name}`);
+
       const params = new URLSearchParams({
         action: "addMachineEnhanced",
         machineName: machineData.name,
@@ -1231,10 +1175,16 @@ class DieselServiceClass {
       );
 
       if (response.success) {
+        console.log(
+          `✅ Queued machine processed successfully: ${machineData.name}`
+        );
         return true;
+      } else {
+        console.error(
+          `❌ Failed to process queued machine: ${response.message}`
+        );
+        return false;
       }
-
-      return false;
     } catch (error) {
       console.error("❌ Error processing queued machine:", error);
       return false;
@@ -1246,6 +1196,10 @@ class DieselServiceClass {
     updates: Partial<Machine>;
   }): Promise<boolean> {
     try {
+      console.log(
+        `✏️ Processing queued machine update: ${updateData.machineName}`
+      );
+
       const params = new URLSearchParams({
         action: "editMachine",
         oldName: updateData.machineName,
@@ -1264,13 +1218,289 @@ class DieselServiceClass {
       );
 
       if (response.success) {
+        console.log(
+          `✅ Queued machine update processed successfully: ${updateData.machineName}`
+        );
         return true;
+      } else {
+        console.error(
+          `❌ Failed to process queued machine update: ${response.message}`
+        );
+        return false;
       }
-
-      return false;
     } catch (error) {
       console.error("❌ Error processing queued machine update:", error);
       return false;
+    }
+  }
+
+  private async processQueuedMachineDelete(deleteData: {
+    machineName: string;
+    machineData: Machine;
+    options?: {
+      forceDelete?: boolean;
+      deletionReason?: string;
+      deletedBy?: string;
+    };
+  }): Promise<boolean> {
+    try {
+      console.log(
+        `🗑️ Processing queued machine deletion: ${deleteData.machineName}`
+      );
+
+      const params = new URLSearchParams({
+        action: "deleteMachine",
+        machineName: deleteData.machineName,
+        forceDelete: deleteData.options?.forceDelete ? "true" : "false",
+        deletionReason: deleteData.options?.deletionReason || "",
+        deletedBy: deleteData.options?.deletedBy || "System",
+        timestamp: Date.now().toString(),
+      });
+
+      const response = await this.makeRequest(
+        `${CONFIG.APPS_SCRIPT_URL}?${params}`
+      );
+
+      if (response.success) {
+        console.log(
+          `✅ Queued machine deletion processed successfully: ${deleteData.machineName}`
+        );
+        return true;
+      } else {
+        console.error(
+          `❌ Failed to process queued machine deletion: ${response.message}`
+        );
+
+        // If backend says machine has logs and we need confirmation,
+        // we should restore the machine locally and notify user
+        if (response.requiresConfirmation && response.hasLogs) {
+          console.log(
+            `⚠️ Machine ${deleteData.machineName} has logs in backend, restoration may be needed`
+          );
+
+          // Add restoration logic here if needed
+          const machines = await this.getMachines();
+          const existingMachine = machines.find(
+            (m) => m.name === deleteData.machineName
+          );
+
+          if (!existingMachine) {
+            // Restore machine to local cache since backend rejected deletion
+            machines.push(deleteData.machineData);
+            await this.cacheData(STORAGE_KEYS.MACHINES, machines);
+            console.log(
+              `🔄 Restored ${deleteData.machineName} to local cache due to backend logs`
+            );
+          }
+        }
+
+        return false;
+      }
+    } catch (error) {
+      console.error("❌ Error processing queued machine deletion:", error);
+      return false;
+    }
+  }
+
+  private async processQueuedAlertUpdate(alertData: {
+    alertId: string;
+    status: string;
+    resolvedBy?: string;
+    comments?: string;
+  }): Promise<boolean> {
+    try {
+      console.log(`🚨 Processing queued alert update: ${alertData.alertId}`);
+
+      const response = await this.makeRequest(CONFIG.APPS_SCRIPT_URL, {
+        method: "POST",
+        body: JSON.stringify({
+          action: "updateAlertStatus",
+          alertId: alertData.alertId,
+          status: alertData.status,
+          resolvedBy: alertData.resolvedBy,
+          comments: alertData.comments,
+          timestamp: Date.now(),
+        }),
+      });
+
+      if (response.success) {
+        console.log(
+          `✅ Queued alert update processed successfully: ${alertData.alertId}`
+        );
+        return true;
+      } else {
+        console.error(
+          `❌ Failed to process queued alert update: ${response.message}`
+        );
+        return false;
+      }
+    } catch (error) {
+      console.error("❌ Error processing queued alert update:", error);
+      return false;
+    }
+  }
+
+  /**
+   * Enhanced offline queue processing with support for all machine operations
+   */
+  private async processOfflineQueue(): Promise<void> {
+    if (this.isProcessingQueue || this.offlineQueue.length === 0) {
+      return;
+    }
+
+    if (
+      !this.connectionStatus.isConnected ||
+      !this.connectionStatus.isInternetReachable
+    ) {
+      console.log("⏸️ Cannot process queue: no connection");
+      return;
+    }
+
+    this.isProcessingQueue = true;
+    console.log(
+      `🔄 Processing offline queue with ${this.offlineQueue.length} items...`
+    );
+
+    try {
+      const processedItems: string[] = [];
+      const failedItems: QueuedItem[] = [];
+      let successCount = 0;
+
+      // Sort queue by priority and timestamp
+      const sortedQueue = [...this.offlineQueue].sort((a, b) => {
+        if (a.priority !== b.priority) {
+          return b.priority - a.priority; // Higher priority first
+        }
+        return (
+          new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+        );
+      });
+
+      for (const item of sortedQueue) {
+        try {
+          console.log(
+            `⚙️ Processing queued ${item.type} (attempt ${
+              item.retryCount + 1
+            }/${item.maxRetries}, priority: ${item.priority})`
+          );
+
+          let success = false;
+
+          switch (item.type) {
+            case "entry":
+              success = await this.processQueuedEntry(item.data);
+              break;
+            case "inventory":
+              success = await this.processQueuedInventory(item.data);
+              break;
+            case "machine":
+              success = await this.processQueuedMachine(item.data);
+              break;
+            case "machineUpdate":
+              success = await this.processQueuedMachineUpdate(item.data);
+              break;
+            case "machineDelete":
+              success = await this.processQueuedMachineDelete(item.data);
+              break;
+            case "alertUpdate":
+              success = await this.processQueuedAlertUpdate(item.data);
+              break;
+            default:
+              console.warn(`❓ Unknown queue item type: ${item.type}`);
+              success = true; // Remove unknown types
+          }
+
+          if (success) {
+            processedItems.push(item.id);
+            successCount++;
+            console.log(`✅ Successfully processed ${item.type} ${item.id}`);
+          } else {
+            item.retryCount++;
+            if (item.retryCount >= item.maxRetries) {
+              console.error(
+                `🚫 Max retries reached for ${item.type} ${item.id}, removing from queue`
+              );
+              processedItems.push(item.id);
+
+              // Log failed items for debugging
+              console.error(`💀 Failed item details:`, {
+                id: item.id,
+                type: item.type,
+                data: item.data,
+                retryCount: item.retryCount,
+                maxRetries: item.maxRetries,
+              });
+            } else {
+              failedItems.push(item);
+              console.warn(
+                `⚠️ Failed to process ${item.type} ${item.id}, will retry later (${item.retryCount}/${item.maxRetries})`
+              );
+            }
+          }
+
+          // Small delay between items to avoid overwhelming the backend
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        } catch (error) {
+          console.error(`❌ Error processing queue item ${item.id}:`, error);
+          item.retryCount++;
+          if (item.retryCount < item.maxRetries) {
+            failedItems.push(item);
+          } else {
+            processedItems.push(item.id);
+            console.error(`💀 Item ${item.id} failed permanently:`, error);
+          }
+        }
+      }
+
+      // Remove processed items from queue
+      this.offlineQueue = this.offlineQueue.filter(
+        (item) => !processedItems.includes(item.id)
+      );
+
+      // Add failed items back with updated retry count
+      this.offlineQueue = [...failedItems, ...this.offlineQueue];
+
+      // Re-sort queue
+      this.offlineQueue.sort((a, b) => {
+        if (a.priority !== b.priority) {
+          return b.priority - a.priority;
+        }
+        return (
+          new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+        );
+      });
+
+      await this.cacheData(STORAGE_KEYS.OFFLINE_QUEUE, this.offlineQueue);
+
+      const failedCount = failedItems.length;
+      const removedCount = processedItems.length - successCount; // Items that failed permanently
+
+      console.log(
+        `✨ Queue processing complete. ` +
+          `Processed: ${successCount}, ` +
+          `Failed (will retry): ${failedCount}, ` +
+          `Removed permanently: ${removedCount}, ` +
+          `Remaining: ${this.offlineQueue.length}`
+      );
+
+      // If we have items that need retry, schedule next processing
+      if (failedItems.length > 0) {
+        console.log(
+          `⏰ Scheduling retry for ${failedItems.length} failed items in 30 seconds`
+        );
+        setTimeout(() => {
+          if (
+            this.connectionStatus.isConnected &&
+            this.connectionStatus.isInternetReachable
+          ) {
+            this.processOfflineQueue();
+          }
+        }, 30000); // Retry in 30 seconds
+      }
+    } catch (error) {
+      console.error("💥 Error processing offline queue:", error);
+    } finally {
+      this.isProcessingQueue = false;
     }
   }
 
@@ -1596,23 +1826,86 @@ Make sure you're using the deployed web app URL ending with '/exec'`);
     console.log("🏗️ Adding machine...");
 
     try {
-      // Update local cache immediately
-      const machines = await this.getMachines();
-      const machineWithMeta = {
+      // Validate required fields
+      if (!machine.name?.trim()) {
+        return {
+          success: false,
+          message: "Machine name is required",
+        };
+      }
+
+      if (!machine.plate?.trim()) {
+        return {
+          success: false,
+          message: "Plate number is required",
+        };
+      }
+
+      if (!machine.initialReading || machine.initialReading < 0) {
+        return {
+          success: false,
+          message: "Valid initial reading is required",
+        };
+      }
+
+      if (!machine.standardAvgDiesel || machine.standardAvgDiesel <= 0) {
+        return {
+          success: false,
+          message: "Valid standard average diesel consumption is required",
+        };
+      }
+
+      if (!machine.expectedDailyHours || machine.expectedDailyHours <= 0) {
+        return {
+          success: false,
+          message: "Valid expected daily hours is required",
+        };
+      }
+
+      // Check for duplicates in local cache
+      const existingMachines = await this.getMachines();
+      const duplicateName = existingMachines.find(
+        (m) => m.name.toLowerCase() === machine.name.trim().toLowerCase()
+      );
+      const duplicatePlate = existingMachines.find(
+        (m) => m.plate?.toLowerCase() === machine.plate.trim().toLowerCase()
+      );
+
+      if (duplicateName) {
+        return {
+          success: false,
+          message: `Machine with name "${machine.name}" already exists`,
+        };
+      }
+
+      if (duplicatePlate) {
+        return {
+          success: false,
+          message: `Machine with plate "${machine.plate}" already exists`,
+        };
+      }
+
+      // Create machine with metadata
+      const machineWithMeta: Machine = {
         ...machine,
+        name: machine.name.trim(),
+        plate: machine.plate.trim(),
+        machineType: machine.machineType || "L/hr",
+        ownershipType: machine.ownershipType || "Own",
+        doorNo: machine.doorNo?.trim() || "",
+        remarks: machine.remarks?.trim() || "",
+        dateAdded: machine.dateAdded || new Date().toISOString().split("T")[0],
         id: `machine_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         lastReading: machine.initialReading || 0,
       };
 
-      const existingIndex = machines.findIndex(
-        (m) => m.name === machine.name && m.plate === machine.plate
-      );
-      if (existingIndex === -1) {
-        machines.push(machineWithMeta);
-        await this.cacheData(STORAGE_KEYS.MACHINES, machines);
-      }
+      // Update local cache immediately for better UX
+      const machines = [...existingMachines, machineWithMeta];
+      await this.cacheData(STORAGE_KEYS.MACHINES, machines);
+
+      console.log(`📱 Machine added to local cache: ${machineWithMeta.name}`);
 
       if (
         this.connectionStatus.isConnected &&
@@ -1624,17 +1917,16 @@ Make sure you're using the deployed web app URL ending with '/exec'`);
 
           const params = new URLSearchParams({
             action: "addMachineEnhanced",
-            machineName: machine.name,
-            machinePlate: machine.plate,
-            machineType: machine.machineType || "L/hr",
-            ownershipType: machine.ownershipType || "Own",
-            initialReading: (machine.initialReading || 0).toString(),
-            standardAvgDiesel: (machine.standardAvgDiesel || 0).toString(),
-            expectedDailyHours: (machine.expectedDailyHours || 0).toString(),
-            doorNo: machine.doorNo || "",
-            remarks: machine.remarks || "",
-            dateAdded:
-              machine.dateAdded || new Date().toISOString().split("T")[0],
+            machineName: machineWithMeta.name,
+            machinePlate: machineWithMeta.plate,
+            machineType: machineWithMeta.machineType,
+            ownershipType: machineWithMeta.ownershipType,
+            initialReading: machineWithMeta.initialReading.toString(),
+            standardAvgDiesel: machineWithMeta.standardAvgDiesel.toString(),
+            expectedDailyHours: machineWithMeta.expectedDailyHours.toString(),
+            doorNo: machineWithMeta.doorNo || "",
+            remarks: machineWithMeta.remarks || "",
+            dateAdded: machineWithMeta.dateAdded,
             timestamp: Date.now().toString(),
           });
 
@@ -1643,13 +1935,16 @@ Make sure you're using the deployed web app URL ending with '/exec'`);
           );
 
           if (response.success) {
-            console.log("✅ Machine added successfully!");
+            console.log("✅ Machine added successfully to backend!");
             return {
               success: true,
               message: "Machine added successfully!",
+              machineId: `${machineWithMeta.name}-${machineWithMeta.plate}`,
+              machineName: machineWithMeta.name,
+              machinePlate: machineWithMeta.plate,
             };
           } else {
-            throw new Error(response.message || "Submission failed");
+            throw new Error(response.message || "Backend submission failed");
           }
         } catch (error) {
           console.log(
@@ -1662,13 +1957,16 @@ Make sure you're using the deployed web app URL ending with '/exec'`);
 
       // Queue for later submission
       const queueId = await this.addToOfflineQueue("machine", machine, 3); // Medium priority
-      console.log(`🏗️ Machine queued with ID: ${queueId}`);
+      console.log(`📦 Machine queued with ID: ${queueId}`);
 
       return {
         success: true,
         message: this.connectionStatus.isInternetReachable
           ? "Machine saved locally and will be submitted when backend connection is restored."
           : "Machine saved locally and queued for submission when online.",
+        machineId: `${machineWithMeta.name}-${machineWithMeta.plate}`,
+        machineName: machineWithMeta.name,
+        machinePlate: machineWithMeta.plate,
       };
     } catch (error) {
       console.error("💥 Error adding machine:", error);
@@ -1755,49 +2053,158 @@ Make sure you're using the deployed web app URL ending with '/exec'`);
     }
   }
 
+  // FIXED: updateMachine method in DieselService
   async updateMachine(
     machineName: string,
     updates: Partial<Machine>
   ): Promise<ApiResponse> {
     try {
-      // Update local cache immediately
+      console.log(`✏️ Updating machine: ${machineName}`, updates);
+
+      // Validate machine exists
       const machines = await this.getMachines();
-      const index = machines.findIndex((m) => m.name === machineName);
-      if (index !== -1) {
-        machines[index] = {
-          ...machines[index],
-          ...updates,
-          updatedAt: new Date().toISOString(),
+      const machineIndex = machines.findIndex((m) => m.name === machineName);
+
+      if (machineIndex === -1) {
+        return {
+          success: false,
+          message: `Machine "${machineName}" not found`,
         };
-        await this.cacheData(STORAGE_KEYS.MACHINES, machines);
       }
+
+      const existingMachine = machines[machineIndex];
+
+      // Validate updates
+      if (updates.name && updates.name !== machineName) {
+        const duplicateName = machines.find(
+          (m) =>
+            m.name !== machineName &&
+            m.name.toLowerCase() === updates.name.trim().toLowerCase()
+        );
+        if (duplicateName) {
+          return {
+            success: false,
+            message: `Machine with name "${updates.name}" already exists`,
+          };
+        }
+      }
+
+      if (updates.plate && updates.plate !== existingMachine.plate) {
+        const duplicatePlate = machines.find(
+          (m) =>
+            m.name !== machineName &&
+            m.plate?.toLowerCase() === updates.plate.trim().toLowerCase()
+        );
+        if (duplicatePlate) {
+          return {
+            success: false,
+            message: `Machine with plate "${updates.plate}" already exists`,
+          };
+        }
+      }
+
+      // Validate numeric fields
+      if (
+        updates.standardAvgDiesel !== undefined &&
+        updates.standardAvgDiesel <= 0
+      ) {
+        return {
+          success: false,
+          message: "Standard average diesel must be greater than 0",
+        };
+      }
+
+      if (
+        updates.expectedDailyHours !== undefined &&
+        updates.expectedDailyHours <= 0
+      ) {
+        return {
+          success: false,
+          message: "Expected daily hours must be greater than 0",
+        };
+      }
+
+      if (updates.lastReading !== undefined && updates.lastReading < 0) {
+        return {
+          success: false,
+          message: "Last reading cannot be negative",
+        };
+      }
+
+      // Apply updates to local cache immediately
+      const updatedMachine = {
+        ...existingMachine,
+        ...updates,
+        name: updates.name?.trim() || existingMachine.name,
+        plate: updates.plate?.trim() || existingMachine.plate,
+        doorNo: updates.doorNo?.trim() || existingMachine.doorNo,
+        remarks: updates.remarks?.trim() || existingMachine.remarks,
+        updatedAt: new Date().toISOString(),
+      };
+
+      machines[machineIndex] = updatedMachine;
+      await this.cacheData(STORAGE_KEYS.MACHINES, machines);
+
+      console.log(`📱 Machine updated in local cache: ${updatedMachine.name}`);
 
       if (
         this.connectionStatus.isConnected &&
         this.connectionStatus.isInternetReachable
       ) {
         try {
-          const params = new URLSearchParams({
-            action: "editMachine",
-            oldName: machineName,
-            ...Object.entries(updates).reduce((acc, [key, value]) => {
-              if (value !== undefined && value !== null) {
-                acc[key] = value.toString();
-              }
-              return acc;
-            }, {} as Record<string, string>),
-            updatedAt: new Date().toISOString(),
-            timestamp: Date.now().toString(),
+          console.log("📡 Attempting immediate machine update...");
+
+          // FIXED: Use POST request with proper data structure
+          const response = await this.makeRequest(CONFIG.APPS_SCRIPT_URL, {
+            method: "POST",
+            body: JSON.stringify({
+              action: "editMachine",
+              oldName: machineName,
+              machineName: updates.name || machineName,
+              machinePlate: updates.plate || existingMachine.plate,
+              machineType: updates.machineType || existingMachine.machineType,
+              ownershipType:
+                updates.ownershipType || existingMachine.ownershipType,
+              lastReading:
+                updates.lastReading !== undefined
+                  ? updates.lastReading
+                  : existingMachine.lastReading,
+              standardAvgDiesel:
+                updates.standardAvgDiesel !== undefined
+                  ? updates.standardAvgDiesel
+                  : existingMachine.standardAvgDiesel,
+              expectedDailyHours:
+                updates.expectedDailyHours !== undefined
+                  ? updates.expectedDailyHours
+                  : existingMachine.expectedDailyHours,
+              doorNo:
+                updates.doorNo !== undefined
+                  ? updates.doorNo
+                  : existingMachine.doorNo,
+              remarks:
+                updates.remarks !== undefined
+                  ? updates.remarks
+                  : existingMachine.remarks,
+              dateAdded: updates.dateAdded || existingMachine.dateAdded,
+              updatedAt: new Date().toISOString(),
+              timestamp: Date.now(),
+            }),
           });
 
-          const response = await this.makeRequest(
-            `${CONFIG.APPS_SCRIPT_URL}?${params}`
-          );
-
           if (response.success) {
-            return { success: true, message: "Machine updated successfully!" };
+            console.log("✅ Machine updated successfully in backend!");
+            return {
+              success: true,
+              message: "Machine updated successfully!",
+              updatedMachine: {
+                name: updatedMachine.name,
+                plate: updatedMachine.plate,
+                machineType: updatedMachine.machineType,
+                ownershipType: updatedMachine.ownershipType,
+              },
+            };
           } else {
-            throw new Error(response.message || "Update failed");
+            throw new Error(response.message || "Backend update failed");
           }
         } catch (error) {
           console.log(
@@ -1809,23 +2216,322 @@ Make sure you're using the deployed web app URL ending with '/exec'`);
       }
 
       // Queue for later submission
-      await this.addToOfflineQueue(
+      const queueId = await this.addToOfflineQueue(
         "machineUpdate",
         { machineName, updates },
-        2
-      ); // Medium priority
+        2 // Medium priority
+      );
+      console.log(`📦 Machine update queued with ID: ${queueId}`);
 
       return {
         success: true,
         message: this.connectionStatus.isInternetReachable
           ? "Machine updated locally and will be synced when backend connection is restored."
           : "Machine updated locally and queued for sync when online.",
+        updatedMachine: {
+          name: updatedMachine.name,
+          plate: updatedMachine.plate,
+          machineType: updatedMachine.machineType,
+          ownershipType: updatedMachine.ownershipType,
+        },
       };
     } catch (error) {
       console.error("❌ Error updating machine:", error);
       return {
         success: false,
         message: `Failed to update machine: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`,
+      };
+    }
+  }
+
+  async deleteMachine(
+    machineName: string,
+    options?: {
+      forceDelete?: boolean;
+      deletionReason?: string;
+      deletedBy?: string;
+    }
+  ): Promise<ApiResponse> {
+    try {
+      console.log(`🗑️ Deleting machine: ${machineName}`, options);
+
+      // Validate machine exists
+      const machines = await this.getMachines();
+      const machineIndex = machines.findIndex((m) => m.name === machineName);
+
+      if (machineIndex === -1) {
+        return {
+          success: false,
+          message: `Machine "${machineName}" not found`,
+        };
+      }
+
+      const machineToDelete = machines[machineIndex];
+
+      // Check if machine has logs locally (safety check)
+      const logs =
+        (await this.getCachedData<DieselEntry[]>(STORAGE_KEYS.LOGS)) || [];
+      const hasLogs = logs.some((log) => log.machineName === machineName);
+
+      if (hasLogs && !options?.forceDelete) {
+        return {
+          success: false,
+          message:
+            "Cannot delete machine with existing diesel entries. Use force delete if you want to proceed.",
+          hasLogs: true,
+          requiresConfirmation: true,
+          machineData: {
+            name: machineToDelete.name,
+            plate: machineToDelete.plate,
+            totalEntries: logs.filter((log) => log.machineName === machineName)
+              .length,
+          },
+        };
+      }
+
+      // Create backup of machine data for audit trail
+      const deletionRecord = {
+        deletedAt: new Date().toISOString(),
+        deletedBy: options?.deletedBy || "User",
+        deletionReason: options?.deletionReason || "No reason provided",
+        machineData: { ...machineToDelete },
+        hadLogs: hasLogs,
+        forceDeleted: options?.forceDelete || false,
+      };
+
+      // Store deletion record in cache for audit
+      const deletionHistory =
+        (await this.getCachedData<any[]>("@diesel_tracker:deletion_history")) ||
+        [];
+      deletionHistory.unshift(deletionRecord);
+      await this.cacheData(
+        "@diesel_tracker:deletion_history",
+        deletionHistory.slice(0, 100)
+      ); // Keep last 100
+
+      // Remove from local cache
+      machines.splice(machineIndex, 1);
+      await this.cacheData(STORAGE_KEYS.MACHINES, machines);
+
+      console.log(
+        `📱 Machine removed from local cache: ${machineToDelete.name}`
+      );
+
+      if (
+        this.connectionStatus.isConnected &&
+        this.connectionStatus.isInternetReachable
+      ) {
+        try {
+          console.log("📡 Attempting immediate machine deletion...");
+
+          const params = new URLSearchParams({
+            action: "deleteMachine",
+            machineName: machineName,
+            forceDelete: options?.forceDelete ? "true" : "false",
+            deletionReason: options?.deletionReason || "",
+            deletedBy: options?.deletedBy || "User",
+            timestamp: Date.now().toString(),
+          });
+
+          const response = await this.makeRequest(
+            `${CONFIG.APPS_SCRIPT_URL}?${params}`
+          );
+
+          if (response.success) {
+            console.log("✅ Machine deleted successfully from backend!");
+            return {
+              success: true,
+              message: "Machine deleted successfully!",
+              deletedMachine: {
+                name: machineToDelete.name,
+                plate: machineToDelete.plate,
+              },
+              deletionRecord: deletionRecord,
+            };
+          } else {
+            if (response.requiresConfirmation) {
+              // Backend found logs, restore machine to cache
+              machines.splice(machineIndex, 0, machineToDelete);
+              await this.cacheData(STORAGE_KEYS.MACHINES, machines);
+
+              return {
+                success: false,
+                message: response.message,
+                hasLogs: true,
+                requiresConfirmation: true,
+                machineData: response.deletedMachine,
+              };
+            }
+            throw new Error(response.message || "Backend deletion failed");
+          }
+        } catch (error) {
+          console.log(
+            "⚠️ Immediate machine deletion failed, queuing for later:",
+            error
+          );
+          // Fall through to queue the deletion
+        }
+      }
+
+      // Queue for later submission
+      const queueId = await this.addToOfflineQueue(
+        "machineDelete",
+        {
+          machineName,
+          machineData: machineToDelete,
+          options,
+        },
+        1 // Low priority since it's destructive
+      );
+      console.log(`📦 Machine deletion queued with ID: ${queueId}`);
+
+      return {
+        success: true,
+        message: this.connectionStatus.isInternetReachable
+          ? "Machine deleted locally and will be synced when backend connection is restored."
+          : "Machine deleted locally and queued for sync when online.",
+        deletedMachine: {
+          name: machineToDelete.name,
+          plate: machineToDelete.plate,
+        },
+        deletionRecord: deletionRecord,
+      };
+    } catch (error) {
+      console.error("❌ Error deleting machine:", error);
+      return {
+        success: false,
+        message: `Failed to delete machine: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`,
+      };
+    }
+  }
+
+  async getMachineDetails(
+    machineName: string
+  ): Promise<ApiResponse & { machine?: Machine }> {
+    try {
+      const machines = await this.getMachines();
+      const machine = machines.find((m) => m.name === machineName);
+
+      if (!machine) {
+        return {
+          success: false,
+          message: `Machine "${machineName}" not found`,
+        };
+      }
+
+      return {
+        success: true,
+        message: "Machine details retrieved successfully",
+        machine: machine,
+      };
+    } catch (error) {
+      console.error("❌ Error getting machine details:", error);
+      return {
+        success: false,
+        message: `Failed to get machine details: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`,
+      };
+    }
+  }
+
+  /**
+   * Get deletion history (audit trail)
+   */
+  async getDeletionHistory(): Promise<ApiResponse & { deletions?: any[] }> {
+    try {
+      const deletionHistory =
+        (await this.getCachedData<any[]>("@diesel_tracker:deletion_history")) ||
+        [];
+
+      return {
+        success: true,
+        message: `Retrieved ${deletionHistory.length} deletion records`,
+        deletions: deletionHistory,
+      };
+    } catch (error) {
+      console.error("❌ Error getting deletion history:", error);
+      return {
+        success: false,
+        message: `Failed to get deletion history: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`,
+      };
+    }
+  }
+
+  async restoreDeletedMachine(deletionRecordId: string): Promise<ApiResponse> {
+    try {
+      const deletionHistory =
+        (await this.getCachedData<any[]>("@diesel_tracker:deletion_history")) ||
+        [];
+      const recordIndex = deletionHistory.findIndex(
+        (record) => record.id === deletionRecordId
+      );
+
+      if (recordIndex === -1) {
+        return {
+          success: false,
+          message: "Deletion record not found",
+        };
+      }
+
+      const deletionRecord = deletionHistory[recordIndex];
+      const machineToRestore = deletionRecord.machineData;
+
+      // Check if machine name/plate conflicts with existing machines
+      const existingMachines = await this.getMachines();
+      const nameConflict = existingMachines.find(
+        (m) => m.name === machineToRestore.name
+      );
+      const plateConflict = existingMachines.find(
+        (m) => m.plate === machineToRestore.plate
+      );
+
+      if (nameConflict || plateConflict) {
+        return {
+          success: false,
+          message:
+            "Cannot restore: Machine name or plate number already exists",
+        };
+      }
+
+      // Restore machine to cache
+      const restoredMachine = {
+        ...machineToRestore,
+        id: `restored_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+        updatedAt: new Date().toISOString(),
+        restoredAt: new Date().toISOString(),
+        restoredFrom: deletionRecordId,
+      };
+
+      existingMachines.push(restoredMachine);
+      await this.cacheData(STORAGE_KEYS.MACHINES, existingMachines);
+
+      // Remove from deletion history
+      deletionHistory.splice(recordIndex, 1);
+      await this.cacheData("@diesel_tracker:deletion_history", deletionHistory);
+
+      // Queue restore operation for backend sync
+      await this.addToOfflineQueue("machine", restoredMachine, 4); // High priority
+
+      return {
+        success: true,
+        message: "Machine restored successfully",
+        restoredMachine: {
+          name: restoredMachine.name,
+          plate: restoredMachine.plate,
+        },
+      };
+    } catch (error) {
+      console.error("❌ Error restoring machine:", error);
+      return {
+        success: false,
+        message: `Failed to restore machine: ${
           error instanceof Error ? error.message : "Unknown error"
         }`,
       };

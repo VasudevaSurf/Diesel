@@ -20,7 +20,6 @@ import { useColorScheme } from "@/hooks/useColorScheme";
 import { DieselService, Machine } from "@/services/DieselService";
 import { Picker } from "@react-native-picker/picker";
 import * as Sharing from "expo-sharing";
-import ViewShot from "react-native-view-shot";
 
 export default function AdminScreen() {
   const colorScheme = useColorScheme();
@@ -41,6 +40,22 @@ export default function AdminScreen() {
   const [doorNo, setDoorNo] = useState<string>("");
   const [machineRemarks, setMachineRemarks] = useState<string>("");
   const [dateAdded, setDateAdded] = useState<string>("");
+
+  // Edit Machine Modal State
+  const [editModalVisible, setEditModalVisible] = useState<boolean>(false);
+  const [editingMachine, setEditingMachine] = useState<Machine | null>(null);
+  const [editMachineName, setEditMachineName] = useState<string>("");
+  const [editMachinePlate, setEditMachinePlate] = useState<string>("");
+  const [editMachineType, setEditMachineType] = useState<string>("L/hr");
+  const [editOwnershipType, setEditOwnershipType] = useState<string>("Own");
+  const [editLastReading, setEditLastReading] = useState<string>("");
+  const [editStandardAvgDiesel, setEditStandardAvgDiesel] =
+    useState<string>("");
+  const [editExpectedDailyHours, setEditExpectedDailyHours] =
+    useState<string>("");
+  const [editDoorNo, setEditDoorNo] = useState<string>("");
+  const [editMachineRemarks, setEditMachineRemarks] = useState<string>("");
+  const [editDateAdded, setEditDateAdded] = useState<string>("");
 
   // Back Log Form State
   const [backLogDate, setBackLogDate] = useState<string>("");
@@ -102,6 +117,35 @@ export default function AdminScreen() {
     return true;
   };
 
+  const validateEditMachineForm = (): boolean => {
+    if (!editMachineName.trim()) {
+      Alert.alert("Error", "Please enter machine name");
+      return false;
+    }
+
+    if (!editMachinePlate.trim()) {
+      Alert.alert("Error", "Please enter plate number");
+      return false;
+    }
+
+    if (!editLastReading || parseFloat(editLastReading) < 0) {
+      Alert.alert("Error", "Please enter valid last reading");
+      return false;
+    }
+
+    if (!editStandardAvgDiesel || parseFloat(editStandardAvgDiesel) <= 0) {
+      Alert.alert("Error", "Please enter valid standard average diesel");
+      return false;
+    }
+
+    if (!editExpectedDailyHours || parseFloat(editExpectedDailyHours) <= 0) {
+      Alert.alert("Error", "Please enter valid expected daily hours");
+      return false;
+    }
+
+    return true;
+  };
+
   const handleAddMachine = async () => {
     if (!validateAddMachineForm()) return;
 
@@ -144,6 +188,69 @@ export default function AdminScreen() {
     }
   };
 
+  const handleEditMachine = async () => {
+    if (!validateEditMachineForm() || !editingMachine) return;
+
+    try {
+      setLoading(true);
+
+      const updates: Partial<Machine> = {
+        name: editMachineName.trim(),
+        plate: editMachinePlate.trim(),
+        machineType: editMachineType,
+        ownershipType: editOwnershipType,
+        lastReading: parseFloat(editLastReading),
+        standardAvgDiesel: parseFloat(editStandardAvgDiesel),
+        expectedDailyHours: parseFloat(editExpectedDailyHours),
+        doorNo: editDoorNo.trim(),
+        remarks: editMachineRemarks.trim(),
+        dateAdded: editDateAdded,
+      };
+
+      const result = await DieselService.updateMachine(
+        editingMachine.name,
+        updates
+      );
+
+      if (result.success) {
+        Alert.alert("Success", "Machine updated successfully!", [
+          {
+            text: "OK",
+            onPress: () => {
+              setEditModalVisible(false);
+              resetEditForm();
+              loadMachines();
+            },
+          },
+        ]);
+      } else {
+        Alert.alert("Error", result.message || "Failed to update machine");
+      }
+    } catch (error) {
+      console.error("Error updating machine:", error);
+      Alert.alert("Error", "Failed to update machine. Please try again.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const openEditModal = (machine: Machine) => {
+    setEditingMachine(machine);
+    setEditMachineName(machine.name);
+    setEditMachinePlate(machine.plate || "");
+    setEditMachineType(machine.machineType || "L/hr");
+    setEditOwnershipType(machine.ownershipType || "Own");
+    setEditLastReading((machine.lastReading || 0).toString());
+    setEditStandardAvgDiesel((machine.standardAvgDiesel || 0).toString());
+    setEditExpectedDailyHours((machine.expectedDailyHours || 0).toString());
+    setEditDoorNo(machine.doorNo || "");
+    setEditMachineRemarks(machine.remarks || "");
+    setEditDateAdded(
+      machine.dateAdded || new Date().toISOString().split("T")[0]
+    );
+    setEditModalVisible(true);
+  };
+
   const resetAddMachineForm = () => {
     setMachineName("");
     setMachinePlate("");
@@ -155,6 +262,20 @@ export default function AdminScreen() {
     setDoorNo("");
     setMachineRemarks("");
     setDateAdded(new Date().toISOString().split("T")[0]);
+  };
+
+  const resetEditForm = () => {
+    setEditingMachine(null);
+    setEditMachineName("");
+    setEditMachinePlate("");
+    setEditMachineType("L/hr");
+    setEditOwnershipType("Own");
+    setEditLastReading("");
+    setEditStandardAvgDiesel("");
+    setEditExpectedDailyHours("");
+    setEditDoorNo("");
+    setEditMachineRemarks("");
+    setEditDateAdded("");
   };
 
   const validateBackLogForm = (): boolean => {
@@ -187,14 +308,13 @@ export default function AdminScreen() {
     try {
       setLoading(true);
 
-      // For now, we'll use the regular entry submission with back-dated info
       const entryData = {
         machineName: backLogMachine,
         startReading: parseFloat(backLogStartReading),
         endReading: parseFloat(backLogEndReading),
         dieselFilled: parseFloat(backLogDiesel),
         remarks: backLogRemarks || "Back-dated entry",
-        phoneNumber: "0000000000", // Default for admin entries
+        phoneNumber: "0000000000",
         imageURL: "",
       };
 
@@ -239,7 +359,6 @@ export default function AdminScreen() {
 
   const generateQRData = (machine: Machine) => {
     const machineId = generateMachineId(machine);
-    // This should match your app's deep linking URL scheme
     return `dieselpro://entry?machineId=${encodeURIComponent(machineId)}`;
   };
 
@@ -252,8 +371,6 @@ export default function AdminScreen() {
     if (!selectedMachineForQR) return;
 
     try {
-      // This would require implementing ViewShot for capturing QR code
-      // For now, we'll share the QR data as text
       const qrData = generateQRData(selectedMachineForQR);
       const machineId = generateMachineId(selectedMachineForQR);
 
@@ -271,21 +388,102 @@ export default function AdminScreen() {
     }
   };
 
+  // FIXED: Implement proper delete functionality
   const deleteMachine = (machine: Machine) => {
     Alert.alert(
       "Delete Machine",
-      `Are you sure you want to delete "${generateMachineId(machine)}"?`,
+      `Are you sure you want to delete "${generateMachineId(
+        machine
+      )}"?\n\nThis action cannot be undone.`,
       [
         { text: "Cancel", style: "cancel" },
         {
           text: "Delete",
           style: "destructive",
           onPress: async () => {
-            // Implement delete functionality
-            Alert.alert(
-              "Info",
-              "Delete functionality will be implemented in backend"
-            );
+            try {
+              setLoading(true);
+
+              // Call the actual delete function from DieselService
+              const result = await DieselService.deleteMachine(machine.name, {
+                deletionReason: "Deleted from admin panel",
+                deletedBy: "Admin User",
+                forceDelete: false,
+              });
+
+              if (result.success) {
+                Alert.alert("Success", "Machine deleted successfully!", [
+                  {
+                    text: "OK",
+                    onPress: () => {
+                      loadMachines(); // Reload the machines list
+                    },
+                  },
+                ]);
+              } else {
+                // Handle case where deletion requires confirmation
+                if (result.hasLogs && result.requiresConfirmation) {
+                  Alert.alert(
+                    "Machine Has Logs",
+                    result.message + "\n\nDo you want to force delete?",
+                    [
+                      { text: "Cancel", style: "cancel" },
+                      {
+                        text: "Force Delete",
+                        style: "destructive",
+                        onPress: async () => {
+                          try {
+                            const forceResult =
+                              await DieselService.deleteMachine(machine.name, {
+                                deletionReason:
+                                  "Force deleted from admin panel",
+                                deletedBy: "Admin User",
+                                forceDelete: true,
+                              });
+
+                            if (forceResult.success) {
+                              Alert.alert(
+                                "Success",
+                                "Machine force deleted successfully!"
+                              );
+                              loadMachines();
+                            } else {
+                              Alert.alert(
+                                "Error",
+                                forceResult.message ||
+                                  "Failed to force delete machine"
+                              );
+                            }
+                          } catch (error) {
+                            console.error(
+                              "Error force deleting machine:",
+                              error
+                            );
+                            Alert.alert(
+                              "Error",
+                              "Failed to force delete machine. Please try again."
+                            );
+                          }
+                        },
+                      },
+                    ]
+                  );
+                } else {
+                  Alert.alert(
+                    "Error",
+                    result.message || "Failed to delete machine"
+                  );
+                }
+              }
+            } catch (error) {
+              console.error("Error deleting machine:", error);
+              Alert.alert(
+                "Error",
+                "Failed to delete machine. Please try again."
+              );
+            } finally {
+              setLoading(false);
+            }
           },
         },
       ]
@@ -353,9 +551,23 @@ export default function AdminScreen() {
           <Text style={styles.bold}>Expected Daily:</Text>{" "}
           {item.expectedDailyHours || "N/A"} hrs
         </Text>
+        {item.doorNo && (
+          <Text style={styles.machineDetail}>
+            <Text style={styles.bold}>Door No:</Text> {item.doorNo}
+          </Text>
+        )}
       </View>
 
       <View style={styles.machineActions}>
+        <TouchableOpacity
+          style={[styles.actionButton, { backgroundColor: "#28a745" }]}
+          onPress={() => openEditModal(item)}
+          disabled={loading}
+        >
+          <IconSymbol name="gear" size={16} color="white" />
+          <Text style={styles.actionButtonText}>Edit</Text>
+        </TouchableOpacity>
+
         <TouchableOpacity
           style={[styles.actionButton, { backgroundColor: "#17a2b8" }]}
           onPress={() => showQRCode(item)}
@@ -367,6 +579,7 @@ export default function AdminScreen() {
         <TouchableOpacity
           style={[styles.actionButton, { backgroundColor: "#dc3545" }]}
           onPress={() => deleteMachine(item)}
+          disabled={loading}
         >
           <IconSymbol name="trash" size={16} color="white" />
           <Text style={styles.actionButtonText}>Delete</Text>
@@ -724,51 +937,236 @@ export default function AdminScreen() {
         )}
       </ScrollView>
 
-      {/* QR Code Modal */}
+      {/* Edit Machine Modal */}
+      <Modal
+        visible={editModalVisible}
+        animationType="slide"
+        presentationStyle="pageSheet"
+        onRequestClose={() => setEditModalVisible(false)}
+      >
+        <View style={styles.modalContainer}>
+          <View style={styles.modalHeader}>
+            <TouchableOpacity
+              style={styles.modalCloseButton}
+              onPress={() => setEditModalVisible(false)}
+            >
+              <IconSymbol name="xmark" size={24} color="#333" />
+            </TouchableOpacity>
+            <Text style={styles.modalTitle}>Edit Machine</Text>
+            <TouchableOpacity
+              style={[
+                styles.modalSaveButton,
+                { backgroundColor: Colors[colorScheme ?? "light"].tint },
+              ]}
+              onPress={handleEditMachine}
+              disabled={loading}
+            >
+              <Text style={styles.modalSaveButtonText}>
+                {loading ? "Saving..." : "Save"}
+              </Text>
+            </TouchableOpacity>
+          </View>
+
+          <ScrollView
+            style={styles.modalContent}
+            showsVerticalScrollIndicator={false}
+          >
+            {/* Machine Name and Plate */}
+            <View style={styles.formRow}>
+              <View style={[styles.formGroup, { flex: 1, marginRight: 10 }]}>
+                <Text style={styles.label}>Machine Name *</Text>
+                <TextInput
+                  style={styles.input}
+                  value={editMachineName}
+                  onChangeText={setEditMachineName}
+                  placeholder="e.g., JCB-12"
+                />
+              </View>
+
+              <View style={[styles.formGroup, { flex: 1, marginLeft: 10 }]}>
+                <Text style={styles.label}>Plate No / Engine No *</Text>
+                <TextInput
+                  style={styles.input}
+                  value={editMachinePlate}
+                  onChangeText={setEditMachinePlate}
+                  placeholder="e.g., AP09AB1234"
+                />
+              </View>
+            </View>
+
+            {/* Machine Type and Ownership */}
+            <View style={styles.formRow}>
+              <View style={[styles.formGroup, { flex: 1, marginRight: 10 }]}>
+                <Text style={styles.label}>Machine Type *</Text>
+                <View style={styles.pickerContainer}>
+                  <Picker
+                    selectedValue={editMachineType}
+                    onValueChange={setEditMachineType}
+                    style={styles.picker}
+                  >
+                    <Picker.Item label="L/hr (Engine Hours)" value="L/hr" />
+                    <Picker.Item
+                      label="KM/l (Kilometers per Liter)"
+                      value="KM/l"
+                    />
+                  </Picker>
+                </View>
+              </View>
+
+              <View style={[styles.formGroup, { flex: 1, marginLeft: 10 }]}>
+                <Text style={styles.label}>Ownership Type *</Text>
+                <View style={styles.pickerContainer}>
+                  <Picker
+                    selectedValue={editOwnershipType}
+                    onValueChange={setEditOwnershipType}
+                    style={styles.picker}
+                  >
+                    <Picker.Item label="Own" value="Own" />
+                    <Picker.Item label="Rental" value="Rental" />
+                  </Picker>
+                </View>
+              </View>
+            </View>
+
+            {/* Last Reading and Standard Avg */}
+            <View style={styles.formRow}>
+              <View style={[styles.formGroup, { flex: 1, marginRight: 10 }]}>
+                <Text style={styles.label}>Last Reading *</Text>
+                <TextInput
+                  style={styles.input}
+                  value={editLastReading}
+                  onChangeText={setEditLastReading}
+                  placeholder="Current reading"
+                  keyboardType="numeric"
+                />
+              </View>
+
+              <View style={[styles.formGroup, { flex: 1, marginLeft: 10 }]}>
+                <Text style={styles.label}>Standard Avg Diesel *</Text>
+                <TextInput
+                  style={styles.input}
+                  value={editStandardAvgDiesel}
+                  onChangeText={setEditStandardAvgDiesel}
+                  placeholder="Standard consumption rate"
+                  keyboardType="numeric"
+                />
+              </View>
+            </View>
+
+            {/* Expected Daily Hours and Door No */}
+            <View style={styles.formRow}>
+              <View style={[styles.formGroup, { flex: 1, marginRight: 10 }]}>
+                <Text style={styles.label}>Expected Daily Hours *</Text>
+                <TextInput
+                  style={styles.input}
+                  value={editExpectedDailyHours}
+                  onChangeText={setEditExpectedDailyHours}
+                  placeholder="Expected daily working hours"
+                  keyboardType="numeric"
+                />
+              </View>
+
+              <View style={[styles.formGroup, { flex: 1, marginLeft: 10 }]}>
+                <Text style={styles.label}>Door No (Optional)</Text>
+                <TextInput
+                  style={styles.input}
+                  value={editDoorNo}
+                  onChangeText={setEditDoorNo}
+                  placeholder="Internal location"
+                />
+              </View>
+            </View>
+
+            {/* Remarks and Date Added */}
+            <View style={styles.formRow}>
+              <View style={[styles.formGroup, { flex: 1, marginRight: 10 }]}>
+                <Text style={styles.label}>Remarks (Optional)</Text>
+                <TextInput
+                  style={[styles.input, styles.textArea]}
+                  value={editMachineRemarks}
+                  onChangeText={setEditMachineRemarks}
+                  placeholder="Additional notes about this machine"
+                  multiline
+                  numberOfLines={3}
+                />
+              </View>
+
+              <View style={[styles.formGroup, { flex: 1, marginLeft: 10 }]}>
+                <Text style={styles.label}>Date Added</Text>
+                <TextInput
+                  style={styles.input}
+                  value={editDateAdded}
+                  onChangeText={setEditDateAdded}
+                  placeholder="YYYY-MM-DD"
+                />
+              </View>
+            </View>
+          </ScrollView>
+        </View>
+      </Modal>
+
+      {/* FIXED: QR Code Modal with proper styling */}
       <Modal
         visible={qrModalVisible}
         transparent
         animationType="fade"
         onRequestClose={() => setQrModalVisible(false)}
       >
-        <View style={styles.modalOverlay}>
-          <View style={styles.modalContent}>
-            <Text style={styles.modalTitle}>
-              QR Code for{" "}
-              {selectedMachineForQR
-                ? generateMachineId(selectedMachineForQR)
-                : ""}
-            </Text>
+        <View style={styles.qrModalOverlay}>
+          <View style={styles.qrModalContent}>
+            <View style={styles.qrModalHeader}>
+              <Text style={styles.qrModalTitle}>
+                QR Code for{" "}
+                {selectedMachineForQR
+                  ? generateMachineId(selectedMachineForQR)
+                  : ""}
+              </Text>
+              <TouchableOpacity
+                style={styles.qrModalCloseButton}
+                onPress={() => setQrModalVisible(false)}
+              >
+                <IconSymbol name="xmark" size={24} color="#666" />
+              </TouchableOpacity>
+            </View>
 
             {selectedMachineForQR && (
               <View style={styles.qrContainer}>
-                <QRCode
-                  value={generateQRData(selectedMachineForQR)}
-                  size={200}
-                  backgroundColor="white"
-                  color="black"
-                />
+                <View style={styles.qrCodeWrapper}>
+                  <QRCode
+                    value={generateQRData(selectedMachineForQR)}
+                    size={200}
+                    backgroundColor="white"
+                    color="black"
+                  />
+                </View>
 
                 <View style={styles.machineInfo}>
-                  <Text style={styles.machineInfoText}>
-                    <Text style={styles.bold}>{selectedMachineForQR.name}</Text>
+                  <Text style={styles.machineInfoTitle}>
+                    {selectedMachineForQR.name}
                   </Text>
                   <Text style={styles.machineInfoText}>
-                    Plate: {selectedMachineForQR.plate}
+                    <Text style={styles.machineInfoLabel}>Plate:</Text>{" "}
+                    {selectedMachineForQR.plate}
                   </Text>
                   <Text style={styles.machineInfoText}>
-                    Type: {selectedMachineForQR.machineType || "L/hr"}
+                    <Text style={styles.machineInfoLabel}>Type:</Text>{" "}
+                    {selectedMachineForQR.machineType || "L/hr"}
                   </Text>
                   <Text style={styles.machineInfoText}>
-                    Ownership: {selectedMachineForQR.ownershipType || "Own"}
+                    <Text style={styles.machineInfoLabel}>Ownership:</Text>{" "}
+                    {selectedMachineForQR.ownershipType || "Own"}
+                  </Text>
+                  <Text style={styles.machineInfoText}>
+                    <Text style={styles.machineInfoLabel}>Last Reading:</Text>{" "}
+                    {selectedMachineForQR.lastReading || 0}
                   </Text>
                 </View>
               </View>
             )}
 
-            <View style={styles.modalButtons}>
+            <View style={styles.qrModalButtons}>
               <TouchableOpacity
-                style={[styles.modalButton, { backgroundColor: "#17a2b8" }]}
+                style={[styles.qrModalButton, styles.qrShareButton]}
                 onPress={shareQRCode}
               >
                 <IconSymbol
@@ -776,15 +1174,15 @@ export default function AdminScreen() {
                   size={20}
                   color="white"
                 />
-                <Text style={styles.modalButtonText}>Share QR</Text>
+                <Text style={styles.qrModalButtonText}>Share QR</Text>
               </TouchableOpacity>
 
               <TouchableOpacity
-                style={[styles.modalButton, { backgroundColor: "#6c757d" }]}
+                style={[styles.qrModalButton, styles.qrCloseButton]}
                 onPress={() => setQrModalVisible(false)}
               >
                 <IconSymbol name="xmark" size={20} color="white" />
-                <Text style={styles.modalButtonText}>Close</Text>
+                <Text style={styles.qrModalButtonText}>Close</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -967,55 +1365,137 @@ const styles = StyleSheet.create({
     color: "#666",
     marginTop: 10,
   },
-  modalOverlay: {
+  // Modal styles
+  modalContainer: {
     flex: 1,
-    backgroundColor: "rgba(0, 0, 0, 0.7)",
-    justifyContent: "center",
-    alignItems: "center",
-  },
-  modalContent: {
     backgroundColor: "white",
-    borderRadius: 15,
-    padding: 30,
+  },
+  modalHeader: {
+    flexDirection: "row",
     alignItems: "center",
-    maxWidth: 350,
-    width: "90%",
+    justifyContent: "space-between",
+    paddingTop: 50,
+    paddingHorizontal: 20,
+    paddingBottom: 20,
+    borderBottomWidth: 1,
+    borderBottomColor: "#e1e5e9",
+  },
+  modalCloseButton: {
+    padding: 8,
   },
   modalTitle: {
     fontSize: 18,
     fontWeight: "bold",
+    color: "#333",
+  },
+  modalSaveButton: {
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 6,
+  },
+  modalSaveButtonText: {
+    color: "white",
+    fontSize: 14,
+    fontWeight: "600",
+  },
+  modalContent: {
+    flex: 1,
+    paddingHorizontal: 20,
+    paddingTop: 20,
+  },
+
+  // FIXED: QR Modal styles
+  qrModalOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(0, 0, 0, 0.7)",
+    justifyContent: "center",
+    alignItems: "center",
+    padding: 20,
+  },
+  qrModalContent: {
+    backgroundColor: "white",
+    borderRadius: 20,
+    padding: 20,
+    width: "100%",
+    maxWidth: 400,
+    alignItems: "center",
+  },
+  qrModalHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    width: "100%",
     marginBottom: 20,
+  },
+  qrModalTitle: {
+    fontSize: 18,
+    fontWeight: "bold",
+    color: "#333",
+    flex: 1,
     textAlign: "center",
+  },
+  qrModalCloseButton: {
+    padding: 8,
   },
   qrContainer: {
     alignItems: "center",
     marginBottom: 20,
+    width: "100%",
+  },
+  qrCodeWrapper: {
+    backgroundColor: "white",
+    padding: 20,
+    borderRadius: 12,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 8,
+    elevation: 3,
   },
   machineInfo: {
     alignItems: "center",
-    marginTop: 15,
-    gap: 3,
+    marginTop: 20,
+    width: "100%",
+  },
+  machineInfoTitle: {
+    fontSize: 20,
+    fontWeight: "bold",
+    color: "#333",
+    marginBottom: 10,
   },
   machineInfoText: {
     fontSize: 14,
     color: "#666",
+    marginBottom: 4,
     textAlign: "center",
   },
-  modalButtons: {
-    flexDirection: "row",
-    gap: 10,
+  machineInfoLabel: {
+    fontWeight: "bold",
+    color: "#333",
   },
-  modalButton: {
+  qrModalButtons: {
+    flexDirection: "row",
+    gap: 12,
+    width: "100%",
+    marginTop: 10,
+  },
+  qrModalButton: {
     flex: 1,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
-    paddingVertical: 10,
-    paddingHorizontal: 15,
+    paddingVertical: 12,
+    paddingHorizontal: 20,
     borderRadius: 8,
-    gap: 5,
+    gap: 8,
   },
-  modalButtonText: {
+  qrShareButton: {
+    backgroundColor: "#17a2b8",
+  },
+  qrCloseButton: {
+    backgroundColor: "#6c757d",
+  },
+  qrModalButtonText: {
     color: "white",
     fontSize: 14,
     fontWeight: "600",
